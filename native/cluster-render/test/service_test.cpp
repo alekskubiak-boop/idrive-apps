@@ -24,13 +24,23 @@
  * the seat-belt panel parked there; released with the map and at stop; the
  * map's layer choosing it with guide_hold, and a client without the field
  * getting it. The mapping guard (guard.h) striking and disabling the hold
- * on cluster restarts, never the map. */
+ * on cluster restarts, never the map. A video frame repeated: a few bytes
+ * that keep the layer from stalling, to a service that takes repeats; the
+ * last frame whole again to one that does not, to one that restarted and
+ * after the service refuses the layer; a refused layer's still map answered
+ * with one error; repeats waiting behind a whole frame sent as one, or not
+ * at all once a newer frame is queued. The service's reads: a frame split
+ * across reads, several messages in one, one of the largest length, and one
+ * longer or empty disconnecting only its client. */
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstring>
 
 #include <cstdio>
@@ -563,6 +573,377 @@ static void mapping_guard()
     unlink(path.c_str());
 }
 
+/* A service that answers the hello as told and keeps what the client
+ * sends. */
+struct Answering {
+    std::string path = "/tmp/crs-answering-" + std::to_string(getpid()) + "-" + std::to_string(next_rig()) + ".sock";
+    int lfd = -1, fd = -1;
+    std::string hello, in;
+    explicit Answering(const std::string &h) : hello(h)
+    {
+        struct sockaddr_un a;
+        std::memset(&a, 0, sizeof a);
+        a.sun_family = AF_UNIX;
+        std::snprintf(a.sun_path, sizeof a.sun_path, "%s", path.c_str());
+        unlink(path.c_str());
+        lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (bind(lfd, (struct sockaddr *)&a, sizeof a) < 0 || listen(lfd, 1) < 0)
+            std::printf("answering: %s\n", std::strerror(errno));
+    }
+    ~Answering()
+    {
+        close(fd);
+        close(lfd);
+        unlink(path.c_str());
+    }
+    void pump(cr::Client &c, int64_t *now)
+    {
+        for (int i = 0; i < 20; i++) {
+            *now += 5;
+            c.poll(*now);
+            pollfd p{lfd, POLLIN, 0};
+            if (fd < 0 && ::poll(&p, 1, 0) > 0) {
+                fd = accept(lfd, nullptr, nullptr);
+                const std::string m = cr::encode(cr::kJson, hello);
+                if (write(fd, m.data(), m.size()) != (ssize_t)m.size())
+                    std::printf("answering: write failed\n");
+            }
+            char b[65536];
+            pollfd q{fd, POLLIN, 0};
+            while (fd >= 0 && ::poll(&q, 1, 0) > 0) {
+                const ssize_t n = read(fd, b, sizeof b);
+                if (n <= 0)
+                    break;
+                in.append(b, (size_t)n);
+            }
+        }
+    }
+    void send(const std::string &json)
+    {
+        const std::string m = cr::encode(cr::kJson, json);
+        if (write(fd, m.data(), m.size()) != (ssize_t)m.size())
+            std::printf("answering: write failed\n");
+    }
+    /* What came since the last call: J bodies as they are, F as "F <id> <pixel bytes>". */
+    std::vector<std::string> take()
+    {
+        std::vector<std::string> out;
+        size_t off = 0, used = 0, n = 0;
+        uint8_t type = 0;
+        const char *body = nullptr;
+        bool bad = false;
+        while (cr::next_message(in.data() + off, in.size() - off, &used, &type, &body, &n, &bad)) {
+            cr::FrameHeader h;
+            if (type == cr::kFrame && cr::parse_frame(body, n, &h))
+                out.push_back("F " + std::to_string(h.id) + " " + std::to_string(h.pixel_bytes));
+            else
+                out.push_back(std::string(body, n));
+            off += used;
+        }
+        in.erase(0, off);
+        return out;
+    }
+};
+
+static bool has(const std::vector<std::string> &m, const std::string &s)
+{
+    for (const std::string &x : m)
+        if (x.find(s) != std::string::npos)
+            return true;
+    return false;
+}
+
+static void repeats()
+{
+    const std::vector<uint8_t> f1 = atlas(1);
+    const std::string frame = "F 1 " + std::to_string(f1.size());
+    cr::LayerOptions lo;
+    lo.target = "map";
+    cr::VideoOptions vo;
+    vo.stall_ms = 1000;
+    {
+        Rig r;
+        cr::Client a("waze", r.path);
+        Events ea;
+        ea.wire(a);
+        r.clients = {&a};
+        r.pump(50);
+        const uint32_t map = a.video(lo, vo);
+        ok("repeat: refused before the layer's first frame", !a.repeat(map, 1));
+        a.frame(map, f1.data(), f1.size(), 1);
+        r.pump(200);
+        bool taken = true, shown = true;
+        for (int i = 0; i < 40; i++) {
+            taken = taken && a.repeat(map, (uint64_t)i + 2);
+            r.pump(50);
+            shown = shown && ea.layer[map] == "shown";
+        }
+        const std::vector<const Layer *> v = r.svc->compositor().layers();
+        ok("repeats keep a video layer shown past its stall_ms, counted as unchanged frames",
+           taken && shown && v.size() == 1 && v[0]->stats().find("1 sent, 40 unchanged") == 0);
+        r.pump(1100);
+        ok("and with neither frames nor repeats it stalls", ea.layer[map] == "stalled");
+    }
+    {
+        /* A layer the service refuses, with a still map: one error for its
+         * frames and repeats, however many come. */
+        Rig r;
+        cr::Client a("waze", r.path);
+        Events ea;
+        ea.wire(a);
+        r.clients = {&a};
+        r.pump(50);
+        cr::LayerOptions nowhere = lo;
+        nowhere.target = "cockpit";
+        const uint32_t map = a.video(nowhere, vo);
+        a.frame(map, f1.data(), f1.size(), 1);
+        r.pump(50);
+        for (int i = 0; i < 40; i++) {
+            a.repeat(map, (uint64_t)i + 2);
+            r.pump(35);
+        }
+        int frame_errors = 0;
+        for (const std::string &e : ea.errors)
+            frame_errors += e.find("frame: ") == 0 || e.find("repeat: ") == 0;
+        ok("a refused layer's still map: one error for its frames and repeats", frame_errors == 1 &&
+                                                                                  ea.errors.size() == 2);
+        Raw raw(r.path);
+        raw.send("{\"op\":\"hello\",\"app\":\"raw\",\"proto\":1}");
+        for (int i = 0; i < 20; i++)
+            raw.send("{\"op\":\"repeat\",\"ref\":7}");
+        r.pump(50);
+        const std::string ev = raw.events();
+        size_t n = 0;
+        for (size_t at = ev.find("no such layer"); at != std::string::npos; at = ev.find("no such layer", at + 1))
+            n++;
+        ok("repeats for a ref the service has not got: answered once", n == 1);
+    }
+    int64_t now = 0;
+    const std::string with_repeats =
+        "{\"ev\":\"hello\",\"proto\":1,\"backend\":\"fake\",\"targets\":\"map:1920x720\",\"repeat\":1}";
+    {
+        Answering s(with_repeats);
+        cr::Client c("waze", s.path);
+        s.pump(c, &now);
+        const uint32_t map = c.video(lo, vo);
+        c.frame(map, f1.data(), f1.size(), 1);
+        s.pump(c, &now);
+        s.send("{\"ev\":\"error\",\"op\":\"frame\",\"ref\":" + std::to_string(map) + ",\"reason\":\"no such layer\"}");
+        s.pump(c, &now);
+        s.take();
+        c.repeat(map, 2);
+        s.pump(c, &now);
+        const std::vector<std::string> m = s.take();
+        ok("the service refuses the layer: its next repeat goes as the last frame whole",
+           m.size() == 1 && m[0] == "F 2 " + std::to_string(f1.size()));
+    }
+    {
+        /* Behind whole frames the service has not read yet: seven other
+         * layers' frames, more than any socket buffer takes. */
+        cr::VideoOptions big = vo;
+        big.w = 1920;
+        big.h = 720;
+        const std::vector<uint8_t> f(1920 * 1080, 7);
+        Answering s(with_repeats);
+        cr::Client c("waze", s.path);
+        s.pump(c, &now);
+        std::vector<uint32_t> refs;
+        for (int i = 0; i < 8; i++)
+            refs.push_back(c.video(lo, big));
+        const uint32_t map = refs[0];
+        c.frame(map, f.data(), f.size(), 1);
+        for (int i = 0; i < 10; i++)
+            s.pump(c, &now);
+        s.take();
+        auto count_repeats = [&](std::vector<std::string> m) {
+            int n = 0;
+            for (const std::string &x : m)
+                n += x.find("\"op\":\"repeat\"") != std::string::npos;
+            return n;
+        };
+        for (size_t i = 1; i < refs.size(); i++)
+            c.frame(refs[i], f.data(), f.size(), 2);
+        for (int i = 0; i < 5; i++)
+            c.repeat(map, (uint64_t)i + 3);
+        for (int i = 0; i < 20; i++)
+            s.pump(c, &now);
+        std::vector<std::string> m = s.take();
+        ok("repeats waiting behind whole frames go as one", m.size() == 8 && count_repeats(m) == 1);
+        for (size_t i = 1; i < refs.size(); i++)
+            c.frame(refs[i], f.data(), f.size(), 9);
+        c.repeat(map, 10);
+        c.frame(map, f.data(), f.size(), 11);
+        for (int i = 0; i < 20; i++)
+            s.pump(c, &now);
+        m = s.take();
+        ok("a repeat waiting when a newer whole frame is queued is dropped",
+           m.size() == 8 && count_repeats(m) == 0 && has(m, "F 11 " + std::to_string(f.size())));
+        for (size_t i = 1; i < refs.size(); i++)
+            c.frame(refs[i], f.data(), f.size(), 12);
+        c.repeat(map, 13);
+        s.send("{\"ev\":\"error\",\"op\":\"repeat\",\"ref\":" + std::to_string(map) + ",\"reason\":\"no such layer\"}");
+        now += 5;
+        c.poll(now);
+        c.repeat(map, 14);
+        for (int i = 0; i < 20; i++)
+            s.pump(c, &now);
+        m = s.take();
+        ok("a repeat waiting when the layer is refused: dropped for the last frame whole",
+           m.size() == 8 && count_repeats(m) == 0 && has(m, "F 14 " + std::to_string(f.size())));
+    }
+    {
+        Answering s(with_repeats);
+        cr::Client c("waze", s.path);
+        s.pump(c, &now);
+        const uint32_t map = c.video(lo, vo);
+        c.frame(map, f1.data(), f1.size(), 1);
+        s.pump(c, &now);
+        s.take();
+        c.repeat(map, 2);
+        s.pump(c, &now);
+        const std::vector<std::string> m = s.take();
+        ok("to a service that takes repeats: a repeat message, no frame", m.size() == 1 && has(m, "\"op\":\"repeat\""));
+    }
+    {
+        Answering s("{\"ev\":\"hello\",\"proto\":1,\"backend\":\"fake\",\"targets\":\"map:1088x480\"}");
+        cr::Client c("waze", s.path);
+        s.pump(c, &now);
+        const uint32_t map = c.video(lo, vo);
+        std::vector<uint8_t> b = f1;
+        c.frame(map, &b, 1);
+        s.pump(c, &now);
+        ok("to a service without repeats: the frame", has(s.take(), frame));
+        c.repeat(map, 2);
+        c.repeat(map, 3);
+        s.pump(c, &now);
+        const std::vector<std::string> m = s.take();
+        ok("and each repeat as the last frame whole again, newest id",
+           m.size() == 2 && m[0] == "F 2 " + std::to_string(f1.size()) && m[1] == "F 3 " + std::to_string(f1.size()));
+        std::vector<uint8_t> copy;
+        ok("the last frame is kept", c.latest(map, &copy) && copy == f1);
+    }
+    {
+        /* A restart: the first service takes repeats, the next one has not
+         * had the frame. */
+        Answering s("{\"ev\":\"hello\",\"proto\":1,\"backend\":\"fake\",\"targets\":\"map:1088x480\",\"repeat\":1}");
+        cr::Client c("waze", s.path);
+        s.pump(c, &now);
+        const uint32_t map = c.video(lo, vo);
+        c.frame(map, f1.data(), f1.size(), 1);
+        s.pump(c, &now);
+        close(s.fd);
+        s.fd = -1;
+        s.pump(c, &now);
+        ok("the service gone", !c.connected());
+        s.in.clear();
+        for (int i = 0; i < 20 && !c.connected(); i++)
+            s.pump(c, &now);
+        c.repeat(map, 4);
+        s.pump(c, &now);
+        const std::vector<std::string> m = s.take();
+        ok("after a reconnect: the layer made again, and the repeat as the last frame whole",
+           has(m, "\"op\":\"layer\"") && has(m, "F 4 " + std::to_string(f1.size())) && !has(m, "\"op\":\"repeat\""));
+    }
+}
+
+/* The service's reads (recv_buffer.h): a frame split across reads, its
+ * length too, shown byte for byte; several messages in one write; a
+ * message of the largest length taken; one longer and one empty
+ * disconnecting their client and nobody else. */
+static void framing()
+{
+    Rig r;
+    Raw raw(r.path);
+    fcntl(raw.fd, F_SETFL, fcntl(raw.fd, F_GETFL) | O_NONBLOCK);
+    /* All of m, a piece at a time, the service running between pieces. */
+    auto put = [&](const std::string &m, size_t piece) {
+        for (size_t off = 0; off < m.size();) {
+            const ssize_t k = write(raw.fd, m.data() + off, std::min(piece, m.size() - off));
+            if (k > 0)
+                off += (size_t)k;
+            r.pump(5);
+        }
+    };
+    auto gone = [&](int fd) {
+        char b[4096];
+        for (int i = 0; i < 100; i++) {
+            const ssize_t n = read(fd, b, sizeof b);
+            if (n == 0)
+                return true;
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                return true;
+            r.pump(5);
+        }
+        return false;
+    };
+    put(cr::encode(cr::kJson, "{\"op\":\"hello\",\"app\":\"raw\"}") +
+            cr::encode(cr::kJson, "{\"op\":\"layer\",\"ref\":1,\"target\":\"map\",\"kind\":\"video\"}") +
+            cr::encode(cr::kJson, "{\"op\":\"status\"}"),
+        1 << 20);
+    r.pump(20);
+    std::string ev = raw.events();
+    ok("several messages in one write: each answered in order",
+       ev.find("\"ev\":\"hello\"") < ev.find("\"ev\":\"status\"") && ev.find("\"ev\":\"status\"") != std::string::npos &&
+           r.svc->compositor().layers().size() == 1);
+
+    const std::vector<uint8_t> f = atlas(5);
+    const std::string frame = cr::frame_head(1, 1, {}, f.size()) + std::string(f.begin(), f.end());
+    put(frame.substr(0, 2), 1);
+    put(frame.substr(2, 9), 3);
+    put(frame.substr(11, 70000), 70000);
+    put(frame.substr(70011), 300000);
+    r.pump(200);
+    std::vector<uint8_t> rounded(f.size());
+    crk::round_levels(rounded.data(), f.data(), f.size(), 2);
+    bool shown = false;
+    if (FakeGraph *g = r.gpu.graph("map"))
+        for (const auto &kv : g->shown.buffers)
+            shown = shown || (kv.second.f == TexFormat::R8 && kv.second.px == rounded);
+    ok("a frame split across reads, its length too, is shown byte for byte", shown);
+
+    const std::vector<uint8_t> f2 = atlas(6);
+    std::string two = cr::frame_head(1, 2, {}, f.size()) + std::string(f.begin(), f.end()) +
+                      cr::frame_head(1, 3, {}, f2.size()) + std::string(f2.begin(), f2.end()) +
+                      cr::encode(cr::kJson, "{\"op\":\"status\"}");
+    put(two, two.size());
+    r.pump(200);
+    crk::round_levels(rounded.data(), f2.data(), f2.size(), 2);
+    shown = false;
+    if (FakeGraph *g = r.gpu.graph("map"))
+        for (const auto &kv : g->shown.buffers)
+            shown = shown || (kv.second.f == TexFormat::R8 && kv.second.px == rounded);
+    ok("two frames and a message in one write: the newer frame shown", shown);
+
+    std::string largest(4, '\0');
+    for (int i = 0; i < 4; i++)
+        largest[i] = (char)(cr::kMaxMessage >> (8 * i));
+    largest += (char)cr::kFrame;
+    largest += std::string(4, '\x09');   /* ref 0x09090909: none */
+    largest += std::string(cr::kMaxMessage - 5, '\0');
+    raw.in.clear();
+    put(largest + cr::encode(cr::kJson, "{\"op\":\"status\"}"), 1 << 20);
+    r.pump(50);
+    ev = raw.events();
+    ok("a message of the largest length is taken: answered, the client kept",
+       ev.find("no such layer") != std::string::npos && ev.find("\"ev\":\"status\"") != std::string::npos &&
+           r.svc->server().clients() == 1);
+
+    Raw other(r.path);
+    other.send("{\"op\":\"hello\",\"app\":\"other\"}");
+    r.pump(20);
+    std::string longer(4, '\0');
+    for (int i = 0; i < 4; i++)
+        longer[i] = (char)((cr::kMaxMessage + 1) >> (8 * i));
+    put(longer + "F", 5);
+    ok("a message longer than the largest: its client disconnected, its layer removed",
+       gone(raw.fd) && r.svc->compositor().layers().empty() && r.svc->server().clients() == 1);
+    Raw empty(r.path);
+    empty.send_message(std::string(4, '\0') + "J{}");
+    r.pump(20);
+    ok("an empty message: its client disconnected, the other kept",
+       gone(empty.fd) && r.svc->server().clients() == 1 && other.events().find("\"ev\":\"hello\"") != std::string::npos);
+}
+
 int main()
 {
     signal(SIGPIPE, SIG_IGN);
@@ -992,6 +1373,8 @@ int main()
     guide_hold();
     guide_hold_choice();
     mapping_guard();
+    repeats();
+    framing();
     std::printf(failures ? "%d FAILED\n" : "all ok\n", failures);
     return failures ? 1 : 0;
 }

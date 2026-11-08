@@ -75,3 +75,28 @@ assert(!c.enable.some(function (e) { return /journal\.service|logs(-fw)?\.servic
 assert(c.restart.indexOf('waze-on-cluster-journal.service') >= 0);
 assert(c.restart.indexOf('waze-on-cluster-logs.service') < 0 && c.restart.indexOf('waze-on-cluster-logs-fw.service') < 0);
 console.log('ok   journal and logs units: in recmgr, ordered against none of the head unit\'s, started late or on demand, no core dumps, root only in node and the firewall unit');
+
+/* On a head unit that refuses it the capture stays up and exits only on a
+ * stop, with 0: restarted on a failure only, so a clean stop stays stopped. */
+var capture = unit('waze-on-cluster.service');
+assert.deepStrictEqual(capture.Restart, ['on-failure']);
+assert.deepStrictEqual(capture.User, ['hmi_5000']);
+console.log('ok   waze-on-cluster.service: restarted on a failure only, as hmi_5000');
+
+/* The capture waits for BMW's media bus by ordering alone: a requirement on
+ * a head-unit unit could start or stop it, and a Before= of ours on the bus
+ * units could delay them or close an ordering cycle, which systemd breaks by
+ * dropping a job. */
+var MEDIA = ['ufipc_daemon.service', 'avbstreamhandler.service'];
+MEDIA.forEach(function (m) { assert(list(capture, 'After').indexOf(m) >= 0, 'waze-on-cluster.service After=' + m); });
+['Wants', 'Requires', 'BindsTo', 'PartOf', 'Requisite'].forEach(function (k) {
+    list(capture, k).forEach(function (other) {
+        assert(/^(waze-on-cluster|cluster-render)[\w.-]*$/.test(other), 'waze-on-cluster.service ' + k + '=' + other + ': only our own units');
+    });
+});
+c.units.forEach(function (x) {
+    list(unit(x.name), 'Before').forEach(function (other) {
+        assert(MEDIA.concat(['gptp.service', 'early.target']).indexOf(other) < 0, x.name + ' Before=' + other);
+    });
+});
+console.log('ok   waze-on-cluster.service: after ufipc_daemon and avbstreamhandler, ordering only, none of ours before them');

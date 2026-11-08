@@ -25,17 +25,21 @@ a video pipeline:
    thread depacketises RTP to H.264 Annex B (`src/rtp_h264.*`) and decodes it
    with the unit's Intel Media SDK / VAAPI on `/dev/dri/renderD128` to the
    picture's own Y, U and V planes, through any lost packets ("Losses").
+   The GPU also copies each picture out of its own memory (`gpu_copy`;
+   MSDK copies on the CPU without it).
 4. **Draw.** Each frame goes to the shared cluster renderer,
    [cluster-render](../cluster-render), as a
-   video layer (`src/map_feed.*`). The renderer owns the RAMSES participant,
-   the DCSM slots and one upload budget for all its clients.
+   video layer (`src/map_feed.*`): a picture that is the last one again,
+   byte for byte, as a repeat of a few bytes (not even packed), and nothing
+   while the map is hidden. The renderer owns the RAMSES participant, the
+   DCSM slots and one upload budget for all its clients.
 
 ## Install and remove
 
 Install the app `robertn_waze_cluster` from the catalog of
 [idrive-apps](https://github.com/robertnisipeanu/idrive-apps)
 through the [mgu Store](https://github.com/robertnisipeanu/mgu-store). The
-app requires this tool (0.8.1); this tool requires `cluster-render` 0.3.7 and
+app requires this tool (0.9.3); this tool requires `cluster-render` 0.4.0 and
 `mgu-deploy` 0.7.11, the deploy tool version that runs activate and deactivate
 hooks and puts the tool's `recmgr` and `crashNames` names, `aapd` among
 them, on the lists. Requirements resolve across catalog sources.
@@ -50,14 +54,19 @@ and the app says why and offers CarPlay's Patch button, when CarPlay's Remove pa
 the patcher cannot find or recognise one of its edit sites in the binary or
 something else modified it, when the build is outside the proven list and
 CarPlay's Patch button has not patched it, or when `carplay.service` starts another program.
-An update brings an older patch of ours up to date.
+An update brings an older patch of ours up to date. The first install on a
+HIGH F head unit also applies the patch again where 0.8.2's boot recovery
+removed it, but not where boot recovery removed it after failed head-unit
+starts (PATCH.md "Supported head units").
 
-The same hook then writes the Android Auto patch, on the one proven aapd
-build and only on a car coded `KI_KOMBI_VARIANT` 7, and never stops or
-restarts aapd. On any other car or build it leaves aapd as it is, and the
-app's Android Auto line says `Not supported on this car` or `Untested
-Android Auto version`. Whatever happens to Android Auto, the install of the
-CarPlay patch goes ahead.
+The same hook then writes the Android Auto patch, on a proven aapd build or
+one Android Auto's Patch button patched before, only on a car coded
+`KI_KOMBI_VARIANT` 7, and never stops or restarts aapd. On any other car,
+or an aapd build whose edit sites the patcher does not find, it leaves aapd
+as it is and the app's Android Auto status reads `Not supported on this
+car`; on another build whose sites it finds, `Untested version`, and
+Android Auto's Patch button patches it. Whatever happens to Android Auto,
+the install of the CarPlay patch goes ahead.
 
 **Remove.** In the Store, remove the app, then the tool (refused while the
 app is installed). `patchd.js deactivate` reverts only our byte regions,
@@ -99,17 +108,29 @@ stays as it is.
 On a fresh install the patched CarPlay first runs at the next head-unit
 start, which also loads the recmgr entry.
 
-**When CarPlay crashes.** A crash (a core dump, or a watchdog timeout) fails
-`carplay.service`, and the head unit restarts as above; neither the recmgr
-entry nor the drop-in prevents it. The recovery service records the crash
-at once, and a boot step that runs before CarPlay counts the crashed start
-and, at the second crash of the patched CarPlay with no crash-free
-head-unit start in between, restores the original binary before CarPlay
-starts, so CarPlay comes back without the map until CarPlay's Patch button. Where
-recmgr loaded the entry and the head unit stays up, the recovery service
-also restores at the second crash and starts CarPlay again, at most three
-times per head-unit start, 5 s, 15 s and 60 s after a crash. Details:
-PATCH.md "Boot recovery".
+**When the patch keeps the head unit from starting.** A CarPlay crash (a
+core dump, or a watchdog timeout) fails `carplay.service`, and the head
+unit restarts as above; neither the recmgr entry nor the drop-in prevents
+it. Another process the patch makes fail restarts it through recmgr. A boot
+step that runs before CarPlay records each start of the patched CarPlay,
+and the recovery service marks it healthy once CarPlay has run 60 s. The
+next boot step counts a start that was not healthy as failed only on
+evidence: a crash of CarPlay, or a restart recmgr or crashhandler
+recorded, whatever process it names. A switch-off after the healthy window,
+a restart asked for or a start CarPlay never ran in counts nothing; a start
+that ended with no record (a power cut, or a shutdown inside the window
+with no restart record) is unknown, and two of those in a row count one,
+the accepted cost of catching a loop whose records are lost. It restores
+the original binary before CarPlay starts after the first failed start for
+a build outside the proven list, and for a proven one after the second
+with no healthy start between, in a second or two, deciding from small
+state files only. CarPlay comes back without the map, its Status row reads
+`Removed — head unit kept restarting`, and its Patch button applies the
+patch again.
+Where recmgr loaded the entry and the head unit stays up, the recovery
+service also restores at the threshold and starts CarPlay again, at most
+three times per head-unit start, 5 s, 15 s and 60 s after a crash.
+Details: PATCH.md "Boot recovery".
 
 To break a loop by hand: keep the phone from connecting (unplug it, or turn
 off its Wi-Fi and Bluetooth) so CarPlay has no session to crash in, then over
@@ -128,9 +149,9 @@ next head-unit start (**Restart head unit**). `aapd.service` has no
 `OnFailure=`, so no drop-in is needed. A crash or a SIGKILL of aapd that
 `patchd` did not send is followed by `systemctl start aapd.service` 5 s, 15
 s and 60 s later, at most three times per head-unit start, where recmgr
-loaded the entry, and aapd has its own boot recovery: the second crash of
-the patched aapd with no crash-free start in between restores the original
-aapd and aapd.conf before aapd starts.
+loaded the entry, and aapd has its own boot recovery: the second failed
+start of the patched aapd with no healthy start between restores the
+original aapd and aapd.conf before aapd starts.
 
 The phone sends a 1280x720 picture with its map in the top 1280x564, the
 map area's shape; the decoder crops that part (`src_crop` in
@@ -170,9 +191,11 @@ nothing.
 
 Then connect the iPhone to CarPlay. Waze needs its server-side flag 1006 for
 the alternate display. The phone sends SPS, PPS and an IDR only at the start
-of a stream, so the render service runs from boot, joins the media bus at
-once (retrying every second until the AVB bridge is up), and decodes from the
+of a stream, so the render service runs from boot, and decodes from the
 stream's first SPS whether or not the map is shown. The app need not be open.
+It starts once BMW's media bus is up, after `ufipc_daemon.service` and
+`avbstreamhandler.service` (ordering only), and joins the bus at once,
+retrying every second while the bridge is not there.
 
 The map comes up at the stream's first non-blank picture in the native
 central-map slot `0x100` (scene `0x010004f0`, 1088x480), under the gauges,
@@ -239,9 +262,9 @@ the render decodes through a lost packet:
   decode thread depacketises and decodes them in order. Past the queue's
   headroom the oldest packets are dropped, and counted. A slot keeps a
   buffer of at most 2 KB once its packet is out, so large datagrams leave
-  no memory behind. The receive threads run at nice -5 (the unit file's
-  `LimitNICE`), the decode thread at the service's nice 0. The FIFO reader, a byte stream that holds its
-  writer back, decodes on its own thread.
+  no memory behind. Every thread runs at the service's nice 0. The FIFO
+  reader, a byte stream that holds its writer back, decodes on its own
+  thread.
 - Every frame is decoded, since each builds on the one before, but only the
   newest gets a picture. While a later frame's first packet (a new RTP
   timestamp) is already queued, the frames decoded meanwhile skip the
@@ -281,23 +304,114 @@ the render decodes through a lost packet:
   since 12:40:50`) and in `probe.txt`. A status line whose only change is
   the stream's reason is logged at most once every 10 s.
 
-From a shell, `waze-on-cluster -c <conf> run map|panel|hud` (`sail` is an
-alias of `map`) sets the target until the service restarts and prints the
+**Where the map shows** (the HUD contributed by
+[eroobeeroo](https://github.com/eroobeeroo), the choice of both or one after
+[wesleyredhat](https://github.com/wesleyredhat)'s #53). `cluster` (on by
+default) and `hud` (off by default) choose (`src/map_feeds.*`); the app's
+**Show on** sets them to the cluster, the HUD or both, and each change takes
+effect at once:
+
+| | |
+|---|---|
+| Cluster only (the default) | the map on the cluster as always |
+| HUD only | no map scene on the cluster, so the KOMBI shows its own content and the guide hold is not asked for; the HUD takes each frame itself, with the whole upload budget, at most `hud_fps` a second |
+| Both | the cluster first; the HUD gets a copy, and up to half the budget, only what it spends (cluster-render README.md "Upload budget") |
+| Neither (the configuration's alone; the app does not offer it) | no feed and no connection to the renderer; every frame is still decoded, since the phone sends keyframes only when its stream starts, but none gets a picture: no VPP, readback, rounding, copy or hand-off. Turned on again, the map shows with the next frame, without waiting for a keyframe |
+
+cluster-render's `hud` target is slot 0x323 (its README.md "The HUD").
+
+- **Off costs nothing.** With the HUD off there is no HUD connection to the
+  renderer, no layer, no worker thread and no copy, so nothing HUD-related
+  is asked of the KOMBI. On a head unit that refuses the tool, nothing of
+  either runs.
+- **The cluster first.** A new picture goes to the cluster's feed without a
+  copy. The HUD's feed gets a copy of the newest when its next frame is
+  due, at most `hud_fps` (10) a second, and a worker thread at a lower
+  priority scales it to the size it is shown at (`src/atlas_scale.*`, area
+  averaging, `hud_scale_down`); the main loop only copies and hands over,
+  so the cluster's frames never wait for the HUD's. A picture the same as
+  the last (a still map) goes to both as a repeat: the cluster's last frame
+  and the HUD's last scaled one again, a few bytes each, with no copy and
+  no scaling, and both layers stay shown. The copy goes no further than
+  the cluster's map: one decode, one capture. cluster-render writes the
+  HUD's frames, in changed tiles and never packed (a frame goes while the
+  budget has any allowance left, into debt, and waits while it is in debt),
+  from the HUD's share: up to half the
+  budget, what it does not spend going back to the cluster at once.
+- **Size** (`hud_width_pct`): Standard (0, the fitted box, about 57 % of the
+  HUD's width, 453x200), or 30 % to 85 % (680x300, the widest: wider is cut
+  off at the HUD's edges, and a larger saved size is held to it), the
+  picture's shape kept; the app's **Size** slider steps it by 5 %.
+  A new size is a new layer at that size.
+- **Position** (`hud_offset_x`, `hud_offset_y`): pixels of the HUD's scene
+  moved from the centre (+x right, +y down), held so the map stays whole
+  inside the HUD (the status then reports the offset as far as it goes); the
+  app's **Move left**, **Move right**, **Move up** and **Move down** move it
+  10 px a press and **Centre** puts it back. A move only changes the layer's
+  place, so it shows at once.
+- **Made for a HUD.** At the standard size a frame is 135,600 B instead of
+  783,360. On a HUD dark pixels are see-through: the corners are rounded
+  (`hud_round_corners`, a twelfth of its height) and fade to black, and a
+  night map's background is made black (`hud_black_background`): the
+  frame's most common shade, followed frame to frame, and the shades just
+  above it, so the HUD shows the roads, route and labels without Waze's
+  grey-blue field; a day map (light background) is left as it is. Green is
+  never made black, and does not count towards the background.
+- **It gives way.** The HUD map steps aside while the HUD's media and list
+  pop-ups show (cluster-render `hud_yield_slots`), and never takes the HUD
+  from BMW's own content.
+- **Disabled after errors.** cluster-render's mapping guard turns the HUD
+  off after two cluster restarts within 10 s of its mapping; the status
+  says `hud_state` `disabled`, the app shows `HUD map: Disabled after
+  errors`, and its frames are no longer copied or scaled. The cluster's map
+  is not affected. Choosing Cluster and then the HUD again does not undo it; as
+  root, `cluster-render guard-reset` does.
+- Not with `target = panel`, which shares the HUD's scene id.
+- The settings (`cluster`, `hud`, `hud_width_pct`, `hud_offset_x`,
+  `hud_offset_y`) are saved by `patchd` in
+  `/var/opt/waze-on-cluster/map.state.conf` (`map_state_file`), which this
+  tool reads over its configuration at each start, and the app changes the
+  running render at once. They stay out of `waze-on-cluster.local.conf`,
+  which waze-on-cluster 0.8 refuses to start with: `patchd` moves any it
+  finds there into the state file at its start and at an install. Control:
+  `{"cmd":"hud","on":"1"}`, `{"cmd":"hud","hud_width_pct":"70"}`,
+  `{"cmd":"hud","hud_x":"40","hud_y":"-20"}` (strings; an axis left out
+  stays).
+- Per driver profile: the settings are shared by every driver profile until
+  the app's **Own settings for this driver** gives one its own copy. The app
+  tells `patchd` the profile in use (`{"cmd":"profile","id"}`) and the
+  checkbox (`{"cmd":"profile-own","id","on"}`); `patchd` keeps the shared
+  settings and each profile's own in `/var/opt/waze-on-cluster/profiles.json`
+  and writes the ones in effect into `map.state.conf`, as for any change,
+  and the app moves the running render to them. `profiles.json` is written
+  first; a write that fails is tried again, and at its start `patchd` writes
+  `map.state.conf` again from `profiles.json` when a write between the two
+  was cut short. `profile-own` is taken only for the profile last told.
+  `map.state.conf` keeps its format, so an older version reads the settings
+  in effect; changes made under an older version are replaced by
+  `profiles.json`'s at the next start while a profile has its own settings.
+  A missing, corrupt or unreadable `profiles.json` means no profile has its
+  own settings (logged).
+
+From a shell, `waze-on-cluster -c <conf> run map|panel` (`sail` is an alias
+of `map`) sets the cluster target until the service restarts and prints the
 status.
 
 ## Status and diagnostics
 
 Once a second the render writes, in `/run/waze-on-cluster/` (mode 0644):
 `status.json`, the status the app shows (`state` idle, starting, showing,
-frozen or error; `page`; `reason`; the shared upload cap as `upload_cap_kb_per_s` and
+frozen or error, or unsupported on a head unit that refuses the tool; `page`; `reason`; the shared upload cap as `upload_cap_kb_per_s` and
 why as `upload_reason`, also in the app's status event); `probe.txt`, the
-sources, the depacketiser (`rtp: packets nals aus seq_gaps lost dropped bad`),
-the receive queue (`queue: N dropped, at most M of 4096 packets waiting, K KB
+sources, the depacketiser (`rtp: packets nals aus aus_by_marker seq_gaps lost
+dropped bad`), the receive queue (`queue: N dropped, at most M of 4096 packets waiting, K KB
 held`), its backlog (`backlog: the oldest packet waiting N ms, the longest
 wait M ms; K frames decoded without a picture to catch up`, with `; the
 decoder is behind the stream` while it is), the stream (`stream: whole` or
-the detail above), the decoder, the late-join verdict, the noise filter's
-tile differences and the renderer's own status. `patchd` answers
+the detail above), the decoder and the order it outputs in, the last SPS
+(`sps:`, as the log's SPS line), the frame timing since the start (`frames
+ended by the marker bit ...`, as the log's minute line), the late-join
+verdict, the noise filter's tile differences and the renderer's own status. `patchd` answers
 `{"cmd":"logs"}` with CarPlay, AVB and DLT marker lines and its own log.
 
 Every line the render logs also goes to
@@ -315,7 +429,25 @@ packets waited in it:
 `waze: 1840 frames decoded in the last minute, 12 without a picture to
 catch up, 1 changed, 0 corrupted; the last picture is not blank; 0 losses
 (0 packets), 0 dropped by the receive queue; packets waited 2.4 ms on
-average, 61 ms at most`.
+average, 61 ms at most`. A second line says how the minute's RTP frames
+ended, by their marker bit or by the next frame's timestamp, how long each
+waited from its last packet's arrival until it went to the decoder, and how
+many frames the decoder took in after each frame before that frame came out
+(0 when each comes out as it is decoded; one it takes and never outputs adds
+to frames already waiting in it, never to later ones):
+`waze: frames ended by the marker bit 0, by the next timestamp 1840; handed
+to the decoder 31.6 ms on average after their last packet, 66.0 ms at most;
+the decoder held 0.0 frames on average, 0 at most`.
+
+Each sequence's SPS is logged once, with its source:
+`waze: SPS from avb: High (profile_idc 100) level 4.2, 1920x900,
+pic_order_cnt_type 0, bitstream_restriction max_num_reorder_frames 0
+max_dec_frame_buffering 4` (`bitstream_restriction none` without it, `none
+(no VUI)` without a VUI). The decoder logs the first B slice
+(`decoder: B slices in the stream: output in display order from the next
+SPS`) and each sequence that starts in another output order than the last
+(`decoder: output in display order from this sequence`, or `decoding
+order`).
 
 For a report, use the app's **Logs** page (below), or run as root on the
 unit `sh /var/opt/waze-on-cluster/current/collect-logs.sh [-o <folder>]`:
@@ -327,7 +459,32 @@ files in `/run/cluster-render/`, the render's `status.json` and
 journal of the render, `patchd`, the boot step, the recovery, capture,
 journal and logs services, cluster-render and carplay, the list of boots,
 `ls -l` of both tools' folders, their `*.local.conf`, the date and the
-uptime.
+uptime, and `wifi.txt`: CarPlay's Wi-Fi band (below), each P2P interface's
+`/proc/net/dev` counters and the kernel's last 60 802.1X and DHCP lines for
+the P2P interfaces (from the journal, else `dmesg`).
+
+**CarPlay's Wi-Fi band.** The head unit runs two wireless-CarPlay P2P
+groups, one on 5 GHz and one on 2.4 GHz, bridged on `wlan_bridge`
+(`p2p-wlan0-N` with Broadcom's driver, `p2p-wfd0-N` with NXP's; which name
+is which band is not fixed). On 2.4 GHz, CarPlay's streams and the cluster
+stream together can be more than the link carries, and audio cuts out.
+`patchd` (`patch/wifi_band.js`) reads `/proc/net/tcp` and `tcp6` every 15
+s. While carplay holds a connection to the phone, it compares each P2P
+interface's received bytes in `/proc/net/dev` over 5 s at the start, then
+every 2 minutes: the phone's is the one receiving at least 1 KiB/s and 4
+times any other. Its band is the frequency of that interface's group, which
+`patchd` reads from wpa_supplicant over D-Bus with `busctl` (root only, by
+the bus policy; never starting wpa_supplicant): the interface's `P2PDevice`
+`Group`, then the group's `Frequency`. CarPlay over USB, too little traffic
+to tell, or a frequency that cannot be read or is in no band leave the band
+unknown; it is never taken from the interface's name or order. A band once
+known stays for that CarPlay session through a still screen, while its
+interface still receives the most, at least 128 bytes/s. `patchd` logs the
+band when it is first known and when it changes (`CarPlay Wi-Fi: 2.4 GHz
+(p2p-wlan0-1, 2462 MHz, 1180 KB/s)`), unknown after a band, and a frequency
+it could not read; it sends it to the app in its status (`wifi`) and writes
+it, with each P2P interface's rates, to
+`/dev/shm/waze-on-cluster/wifi-band.json` (0644).
 
 Sockets: `/dev/shm/waze-on-cluster/ctl.sock` (the render's status and log,
 and the turn-box switch, group `tm_oap_app`; a connection also starts the
@@ -455,7 +612,8 @@ the link to the cluster, so an upload that outruns it can drop other contents
 too. Details: the cluster-render README.
 
 Settings are in `waze-on-cluster.conf` (documented inline). Overrides go in
-`/var/opt/waze-on-cluster/waze-on-cluster.local.conf`, which updates keep.
+`/var/opt/waze-on-cluster/waze-on-cluster.local.conf`, which updates keep;
+the app's map settings in `/var/opt/waze-on-cluster/map.state.conf`.
 
 ## The patch
 
@@ -464,12 +622,20 @@ verified full backup. `patch/carplay_locate.js` finds each edit's site in the
 build by its code and data and checks it before any write, so the patch
 applies to any carplay build in which every site is found exactly once and
 passes its cross-checks; a build where one does not is left alone, with the
-reason. The install patches only the proven build; another build is a conflict
+reason. The install patches only a proven build; another build is a conflict
 until CarPlay's Patch button (or `apply --unproven`) patches it once. `carplay_patch.js
 probe` (`woc-patch.sh probe`) shows where the sites are in a binary and
-whether it is patchable, without writing. The build the patch was proven on,
-carplay 22.28.3, also has to match its shipped SHA-256 before the first edit.
-Its sites:
+whether it is patchable, without writing. A proven build also has to match
+its shipped SHA-256 before the first edit:
+
+| carplay | build-id | sha256 |
+|---|---|---|
+| 22.28.3 | `5de62156575d737391ea42254e778a97dbbb51f8` | `ddb33e33161387c6479c391684b3d019b0de54ecfcee8d6877eca94aa62f3e50` |
+| 21.27.4 | `389c1d0536f8cc9283c156410f2f2634a9f952c0` | `fb5d6b179ad4f62a968697d21e84dbb80adc1ad8e618a6f02c6a9a0467aca1ac` |
+
+21.27.4 was confirmed on a G07 X7 through CarPlay's Patch button
+([#95](https://github.com/robertnisipeanu/idrive-apps/issues/95)). The
+sites in carplay 22.28.3:
 
 | Edit | What it does | Where (carplay 22.28.3) |
 |---|---|---|
@@ -479,8 +645,10 @@ Its sites:
 | resolution | IC_HIGH geometry → 1088x480 px at 138x61 mm, safe area 504x368+286+72 | four 8 B immediates at `0x20ca32`–`0x20ca7c` |
 
 `patchd` and the install hook apply `--panel high` with the stock sink.
-`woc-patch.sh` is the shell path, for experiments: `status`, `probe`,
-`verify`, `revert [--force]`, and `apply high|mid` with `--avb` (the app's
+`woc-patch.sh` is the shell path, for experiments and for undoing the
+patches without the app: `status`, `probe`, `verify`, `revert [--force]`,
+`aa-status`, `aa-revert [--force]` (aapd and aapd.conf), and `apply
+high|mid` with `--avb` (the app's
 sink), no flag (`udp://127.0.0.1:20557`), `--capture` (FIFO) or `--sink
 <url>`, plus `--res WxH|stock`, `--safe WxH+X+Y|full` and `--unproven`. It
 remounts `/` read-write only for the write. **Never `systemctl stop` or
@@ -490,16 +658,28 @@ loaded, a SIGKILL is a clean exit.
 `revert` restores any binary of the backup's build
 (`/usr/bin/carplay.woc-orig`), and refuses another build (a firmware update)
 unless given `--force`.
+Every write of carplay, aapd or aapd.conf (apply, revert, boot recovery's
+restore) gives the file its original's owner and mode, recorded with the
+backup, with at least 0755 for carplay and aapd and 0644 for aapd.conf, set
+explicitly on the new file and checked before it replaces the old one,
+whatever the umask it runs under. carplay and aapd run as their own users:
+a carplay left `0700` fails to start (`status=203/EXEC`) and the head unit
+restarts in a loop. An apply or revert that finds nothing to change, and
+boot recovery before the service starts, give a file the service's user
+cannot run or read its original's mode and owner.
 
 ## The Android Auto patch
 
 `patch/aapd_patch.js` (Node 8, no dependencies) edits `/usr/bin/aapd` and
-`/etc/aapd.conf` after a verified full backup of each. It applies only to
-aapd 22.39.3 as shipped (sha256 `6880f54c…`, every site checked by its
-anchor bytes on both sides) and the matching aapd.conf (sha256
-`9584c540…`), and only on a car coded `KI_KOMBI_VARIANT` 7, read from
-`/dev/shm/rawcodingdata` the way aapd reads it. Its edits (PATCH.md "Android
-Auto"):
+`/etc/aapd.conf` after a verified full backup of each, only on a car coded
+`KI_KOMBI_VARIANT` 7, read from `/dev/shm/rawcodingdata` the way aapd reads
+it. `patch/aapd_locate.js` finds each edit's site in the build by its code
+(PATCH.md "Android Auto"), and a build where a site is not found is refused
+with the reason. The install patches only a proven build (aapd 22.39.3,
+sha256 `6880f54c…`, by build-id); another build is a conflict until Android
+Auto's Patch button (or `apply --unproven`) patches it once. aapd.conf is edited
+when it has the 12.3" entries and numbers the geometry sets, and refused
+otherwise. Its edits, at the proven build's offsets:
 
 | Edit | What it does | Where |
 |---|---|---|
@@ -509,13 +689,21 @@ Auto"):
 | screen | KombiVariant 2 reads the 12.3" profile, as 0 does | 16 B at `0x15b440` |
 | geometry | aapd.conf's 12.3" entry: a 1280x720 stream with the UI in its top 1280x564 (or whole with the turn card hidden), the chosen density, the safe area 592x432 at 336,84 | numbers in `KOMBI_DISPLAY` |
 
-`aapd_patch.js status | apply [--dpi n] [--card shown|hidden] | revert [--force] [--drop-backup]`
-with `--target`, `--conf` and `--coding` for copies. `revert` needs no
-anchors: each file's backup is trusted by its recorded SHA-256 and written
+`aapd_patch.js status | apply [--dpi n] [--card shown|hidden] [--unproven] | revert [--force] [--drop-backup]`
+with `--target`, `--conf` and `--coding` for copies. `status` names the
+build-id, the version and whether the build is proven. `revert` needs no
+locator: each file's backup is trusted by its recorded SHA-256 and written
 over a file of its own build. **Never `systemctl stop` or `restart` aapd.**
 
 ## Safety
 
+- Every head-unit variant runs, HIGH F included (0.8.2 refused it).
+  Nothing of ours runs only where the variant cannot be read: a kernel
+  command line with no `hwvariant=`, or two that disagree (PATCH.md
+  "Supported head units"). There no patch is written, a patch already on
+  disk is restored at the next boot before carplay or aapd starts, and
+  this tool's capture and the cluster renderer stay idle; the app shows
+  `Status: Not supported on this car` in both sections.
 - The patch is the only change to a BMW binary. It is reversible and fully
   backed up, checks every edit site before writing, refuses a build where a
   site is not found or not recognised, is written by atomic rename, and
@@ -525,9 +713,20 @@ over a file of its own build. **Never `systemctl stop` or `restart` aapd.**
   not), and once its backup exists only the four sites are checked.
   Removal restores the backup's bytes in our edits' regions, or the whole
   backup over a binary of its build the patcher no longer recognises.
-- The Android Auto patch is written only on the proven aapd and aapd.conf,
-  on a car coded `KI_KOMBI_VARIANT` 7, with enough free space on `/` for
-  the backups and a temporary copy. Removal restores both files.
+- The Android Auto patch is written only where every aapd site is found
+  and aapd.conf has what the geometry sets, on a car coded
+  `KI_KOMBI_VARIANT` 7, with enough free space on `/` for the backups and a
+  temporary copy. Its first apply to a proven build also requires the whole
+  file to be the shipped one; another build needs `--unproven` (Android
+  Auto's Patch button passes it, the install does not). Removal restores both
+  files.
+- Every revert works from our verified backup; on carplay 22.28.3, aapd
+  22.39.3 and its aapd.conf also without one, when
+  an edit of ours reads in the file, from its own shipped content, kept only
+  when it is the shipped file whole. A file with nothing of ours in it is
+  left as it is. Each file is written with its original's mode and owner whatever
+  the umask. A removal of the tool fails while an edit of ours still reads in
+  carplay or aapd, so the tool stays with its recovery until it is undone.
 - `patchd` runs as root. It accepts only `apply` (panel `high|mid`, mode
   `avb|udp|fifo`), `revert`, `aa-apply`, `aa-revert`, `aa-density` and
   `aa-card` (one of the fixed values, at most one change every 10 s), `reboot`, `status`,
@@ -535,10 +734,10 @@ over a file of its own build. **Never `systemctl stop` or `restart` aapd.**
   checks `/` is read-only again after every write. It applies no patch and
   restarts nothing on its own. `reboot` is honoured only while a change is
   pending, one at a time, and at most once every 10 minutes.
-- Boot recovery (`recovery.js`, root) changes the binary only through the same
-  revert as CarPlay's Remove patch button or Android Auto's Remove patch button, and only when that revert
-  would change it (`restorable: yes`: a verified backup of the file's own
-  build). Its one action on a service is `systemctl start` of carplay or
+- Boot recovery (`recovery.js`, root) writes back only our backup of the
+  original, verified against the SHA-256 recorded when it was taken, over
+  the backup's own build, and only for a binary its patch record shows as
+  ours or cannot vouch for. Its one action on a service is `systemctl start` of carplay or
   aapd after a crash or a SIGKILL `patchd` did not send, bounded, where
   recmgr loaded the service's entry this boot; it never stops,
   kills or restarts anything. Its shutdown record is a drop-in for
@@ -576,16 +775,21 @@ a root service, so it starts only after a reboot following its install.
 
 `waze-on-cluster-capture.service` sends BMW's DLT control request (service
 `0xf13`, as `dlt-control -u -z 1`) over `/run/dlt-files/dlt-ctrl.sock`, waits
-for the acknowledgement and checks the TCP 3490 listener through procfs. It
-never edits DLT configuration or restarts CarPlay. It refuses unless a DLT
-client is registered, the listener is closed and the newest state record in
-`/run/logntrace/` says unambiguously whether tracing was OFF or BUFFER. It
-records ownership under `/run/woc-dlt-capture` before turning tracing on, and
-restores the recorded mode at the deadline, on stop and in `ExecStopPost`
-(also after SIGKILL). A failed restore shows as `restore_failed` in the app,
-is retried every 5 s and blocks a new capture. DLT is shared ECU-wide:
-restoring closes its TCP clients, and no other tracing tool should run during
-a capture.
+for the acknowledgement and checks the TCP 3490 listener through procfs. A
+default log level below INFO (the log-and-trace manager sets OFF whenever it
+turns tracing off) is set to INFO for the window (service `0x11`, as
+`dlt-control -u -d 4`); otherwise most applications send nothing. It never
+edits DLT configuration or restarts CarPlay. It refuses unless a DLT client is
+registered, the listener is closed and the newest mode record in
+`/run/logntrace/` says unambiguously whether tracing was OFF or BUFFER: the
+daemon's (`<lifecycle>_dltd.idlt`) or the log-and-trace manager's
+(`<lifecycle>_LTM.idlt`, after a resume often the only one), which must agree
+with the daemon's newest. It records ownership under `/run/woc-dlt-capture`
+before changing anything, and restores the recorded mode and default log level
+at the deadline, on stop and in `ExecStopPost` (also after SIGKILL). A failed
+restore shows as `restore_failed` in the app, is retried every 5 s and blocks
+a new capture. DLT is shared ECU-wide: restoring closes its TCP clients, and no
+other tracing tool should run during a capture.
 
 ## Verified, and open
 
@@ -624,8 +828,10 @@ The patch tests run against a copy of the unit's `/usr/bin/carplay`
 `ddb33e33161387c6479c391684b3d019b0de54ecfcee8d6877eca94aa62f3e50`) named by
 `CARPLAY_BIN`; without it they are skipped (`SKIP`). The locator's test runs
 on synthetic builds without it. `aapd_test.js` runs against copies of the
-unit's `/usr/bin/aapd` and `/etc/aapd.conf` (the SHAs above) named by
-`AAPD_BIN` and `AAPD_CONF`, and is skipped without them. The repository
+unit's `/usr/bin/aapd` (aapd 22.39.3) and `/etc/aapd.conf` named by
+`AAPD_BIN` and `AAPD_CONF`, and `aapd_locate_test.js` against `AAPD_BIN`
+and the other aapd builds in `AAPD_BINS` (paths separated by `:`); both
+are skipped without them. The repository
 carries no BMW binary. `test-firmware` runs the unit's own dlt-daemon, libdlt and
 dlt-receive from `ROOTFS`, an extracted root file system of the unit.
 

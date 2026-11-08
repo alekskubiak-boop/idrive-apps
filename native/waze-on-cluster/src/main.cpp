@@ -9,7 +9,7 @@
  * reports its status and log to the Waze app.
  *
  *   waze-on-cluster [-c FILE] [-s key=value]...     serve the control socket
- *   waze-on-cluster [-c FILE] run sail|map|panel|hud
+ *   waze-on-cluster [-c FILE] run sail|map|panel
  *                                                   map that target from now on,
  *                                                   and follow the status from a shell
  *                                                   (sail = map, the native central-map slot)
@@ -40,10 +40,14 @@
 #include "config.h"
 #include "control.h"
 #include "guide_setting.h"
+#include "head_unit.h"
 #include "log.h"
 #include "block_pack.h"
 #include "map_feed.h"
+#include "map_feeds.h"
 #include "map_geometry.h"
+#include "map_state.h"
+#include "refused.h"
 #include "video_producer.h"
 #include "yuv_atlas.h"
 
@@ -79,29 +83,66 @@ std::string status_line(const FeedStatus &s)
            ",\"upload_cap_kb_per_s\":" + std::to_string(s.upload_cap_kb) +
            ",\"upload_reason\":" + json_escape(s.upload_reason) +
            ",\"hide_bmw_guidance\":" + (s.guide_hold ? "1" : "0") +
-           ",\"guide_disabled\":" + (s.guide_disabled ? "1" : "0") + "}";
+           ",\"guide_disabled\":" + (s.guide_disabled ? "1" : "0") +
+           ",\"cluster\":" + (s.cluster ? "1" : "0") +
+           ",\"hud\":" + (s.hud ? "1" : "0") + ",\"hud_state\":" + json_escape(s.hud_state) +
+           ",\"hud_width_pct\":" + std::to_string(s.hud_width_pct) +
+           ",\"hud_x\":" + std::to_string(s.hud_offset_x) + ",\"hud_y\":" + std::to_string(s.hud_offset_y) + "}";
 }
 
 class Server : public Control::Handler {
 public:
-    Server(MapFeed *feed, GuideSetting *guide) : feed_(feed), guide_(guide) {}
+    Server(MapFeeds *feeds, GuideSetting *guide) : feeds_(feeds), guide_(guide) {}
     void set_control(Control *c) { control_ = c; }
 
-    /* start picks the target the map goes to (`run`); the map itself comes
-     * and goes with the stream. guide is the app's switch for BMW's turn
-     * box (guide_setting.h). */
+    /* start picks the cluster target the map goes to (`run`); cluster and
+     * hud turn the map on each off or on ("on"), hud also sizes and places
+     * the HUD's; the map itself
+     * comes and goes with the stream. guide is the app's switch for BMW's
+     * turn box (guide_setting.h). */
     void on_command(const std::map<std::string, std::string> &msg) override
     {
         const std::string &cmd = msg.at("cmd");
         auto it = msg.find("target");
         auto hide = msg.find("hide");
+        auto pct = msg.find("hud_width_pct");
+        auto hx = msg.find("hud_x"), hy = msg.find("hud_y"), on = msg.find("on");
         if (cmd == "start" && it != msg.end()) {
             log_info("start %s", it->second.c_str());
-            if (!feed_->set_target(it->second))
-                log_warn("start: the cluster renderer has no target %s", it->second.c_str());
+            if (!feeds_->set_target(it->second))
+                log_warn("start: the cluster renderer has no cluster target %s", it->second.c_str());
         } else if (cmd == "guide" && hide != msg.end() && guide_->set(hide->second)) {
             log_info("guide: BMW's turn box %s while the map shows", guide_->hide() ? "hidden" : "shown");
-            feed_->set_guide_hold(guide_->hide());
+            feeds_->set_guide_hold(guide_->hide());
+        } else if (cmd == "cluster" && on != msg.end() && (on->second == "0" || on->second == "1")) {
+            feeds_->set_cluster(on->second == "1");
+        } else if (cmd == "hud" && (on != msg.end() || pct != msg.end() || hx != msg.end() || hy != msg.end())) {
+            if (on != msg.end()) {
+                if (on->second == "0" || on->second == "1")
+                    feeds_->set_hud(on->second == "1");
+                else
+                    log_warn("hud: on must be 0 or 1, not %s", on->second.c_str());
+            }
+            if (pct != msg.end()) {
+                const long v = std::strtol(pct->second.c_str(), nullptr, 10);
+                if (v == 0 || (v >= 20 && v <= 100)) {
+                    log_info("hud: map %ld%% wide", v);
+                    feeds_->set_hud_width((unsigned)v);
+                } else {
+                    log_warn("hud: width %s out of range (0, or 20-100)", pct->second.c_str());
+                }
+            }
+            /* and where it is: moved from the centre, in HUD pixels (-800..800 each; held inside the HUD) */
+            if (hx != msg.end() || hy != msg.end()) {
+                const long x = hx != msg.end() ? std::strtol(hx->second.c_str(), nullptr, 10) : feeds_->hud_offset_x();
+                const long y = hy != msg.end() ? std::strtol(hy->second.c_str(), nullptr, 10) : feeds_->hud_offset_y();
+                if (x >= -800 && x <= 800 && y >= -800 && y <= 800) {
+                    log_info("hud: map moved %+ld,%+ld from the centre", x, y);
+                    feeds_->set_hud_offset((int)x, (int)y);
+                } else {
+                    log_warn("hud: offset %ld,%ld out of range (-800..800)", x, y);
+                }
+            }
         } else {
             log_warn("control: unknown or malformed command %s", cmd.c_str());
         }
@@ -130,39 +171,18 @@ public:
     }
 
 private:
-    MapFeed *feed_;
+    MapFeeds *feeds_;
     GuideSetting *guide_;
     Control *control_ = nullptr;
     uint64_t log_seq_ = 0;
     std::string last_;
 };
 
-/* Files next to the FIFO, in the render's own RuntimeDirectory, which it can
- * write: status.json and probe.txt, for the remote diagnostics, read
- * without taking the control socket's owner slot. 0644, world-readable. */
-void write_sibling_file(const std::string &fifo_path, const char *name, const std::string &content)
-{
-    std::string::size_type slash = fifo_path.find_last_of('/');
-    if (slash == std::string::npos)
-        return;
-    std::string path = fifo_path.substr(0, slash) + "/" + name;
-    std::string tmp = path + ".tmp";
-    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0)
-        return;
-    std::string line = content + "\n";
-    ssize_t n = write(fd, line.data(), line.size());
-    close(fd);
-    if (n == (ssize_t)line.size())
-        rename(tmp.c_str(), path.c_str());
-    else
-        unlink(tmp.c_str());
-}
-
-int serve(const Config &cfg)
+int serve(Config cfg)
 {
     if (cfg.has("log_file"))
         log_to_file(cfg.str("log_file"), log_file_cap(cfg.num("log_file_kb")), "waze-on-cluster", WOC_VERSION);
+    load_map_state(&cfg, cfg.str("map_state_file"));
     VideoConfig vc;
     vc.fifo_path = cfg.str("fifo_path");
     vc.carplay_group = cfg.str("carplay_group");
@@ -186,15 +206,19 @@ int serve(const Config &cfg)
     struct Range { const char *key; long lo, hi; } ranges[] = {
         {"dirty_threshold", 0, 64}, {"dirty_settle_ms", 0, 3600000}, {"tex_level_bits", 0, 3},
         {"target_fps", 0, 60},      {"pan_blocks", 0, 1},            {"stall_ms", 1000, 600000},
+        {"cluster", 0, 1},          {"hud", 0, 1},                   {"hud_fps", 1, 30},
+        {"hud_width_pct", 0, 100},  {"hud_offset_x", -800, 800},     {"hud_offset_y", -800, 800},
+        {"hud_scale_down", 0, 1},   {"hud_round_corners", 0, 1},     {"hud_black_background", 0, 1},
         {"freeze_ms", 0, 600000},   {"freeze_min_fps", 1, 60},       {"alt_screen_port", 0, 65535},
         {"idle_ms", 1000, 600000},  {"blank_ms", 1000, 600000},
-        {"alt_screen_uid", 0, 4294967294L}};
+        {"alt_screen_uid", 0, 4294967294L}, {"gpu_copy", 0, 1}};
     for (const Range &r : ranges)
         if (cfg.num(r.key) < r.lo || cfg.num(r.key) > r.hi) {
             log_error("%s must be from %ld to %ld", r.key, r.lo, r.hi);
             return 1;
         }
     vc.tex_level_bits = (uint32_t)cfg.num("tex_level_bits");
+    vc.gpu_copy = cfg.num("gpu_copy") == 1;
     vc.stall_ms = (int)cfg.num("stall_ms");
     vc.freeze.ms = (unsigned)cfg.num("freeze_ms");
     vc.freeze.min_fps = (unsigned)cfg.num("freeze_min_fps");
@@ -205,10 +229,21 @@ int serve(const Config &cfg)
     fc.target = cfg.str("target");
     if (const char *why = parse_map_rect(cfg.str("map_rect"), &fc.rect))
         log_warn("map_rect = %s is ignored: %s; the map area instead", cfg.str("map_rect").c_str(), why);
+    fc.hud_width_pct = (unsigned)cfg.num("hud_width_pct");
+    if (fc.hud_width_pct && fc.hud_width_pct < 20) {
+        log_warn("hud_width_pct %u: 0 or 20-100; the default box instead", fc.hud_width_pct);
+        fc.hud_width_pct = 0;
+    }
+    fc.hud_offset_x = (int)cfg.num("hud_offset_x");
+    fc.hud_offset_y = (int)cfg.num("hud_offset_y");
+    fc.scale_down = cfg.num("hud_scale_down") != 0;
+    fc.hud_round_corners = cfg.num("hud_round_corners") != 0;
+    fc.hud_black_background = cfg.num("hud_black_background") != 0;
+    fc.scaled_level_bits = vc.tex_level_bits;
     fc.video.w = vc.tex_width;
     fc.video.h = vc.tex_height;
     fc.video.fps = (unsigned)cfg.num("target_fps");
-    fc.video.level_bits = 0;   /* rounded on the decoder thread (video_producer.h) */
+    fc.video.level_bits = 0;   /* rounded in the decoder's packing (video_producer.h) */
     fc.video.dirty_threshold = (unsigned)cfg.num("dirty_threshold");
     fc.video.settle_ms = (unsigned)cfg.num("dirty_settle_ms");
     fc.video.pan_blocks = cfg.num("pan_blocks") == 1 && vc.tex_height % 4 == 0;
@@ -229,7 +264,7 @@ int serve(const Config &cfg)
 
     std::string err;
     VideoProducer producer(vc);
-    MapFeed feed(fc);
+    MapFeeds feed(fc, cfg.num("cluster") == 1, cfg.num("hud") == 1, (unsigned)cfg.num("hud_fps"));
     Server server(&feed, &guide);
     Control control(&server);
     server.set_control(&control);
@@ -250,14 +285,15 @@ int serve(const Config &cfg)
     AltScreen::State alt_state = AltScreen::Unknown;
     int64_t alt_read_ms = 0;
     for (;;) {
-        struct pollfd p[5] = {{sig_fd, POLLIN, 0}, {control.listen_fd(), POLLIN, 0}, {control.owner_fd(), POLLIN, 0},
-                              {feed.fd(), (short)(POLLIN | (feed.wants_write() ? POLLOUT : 0)), 0},
-                              {producer.ready_fd(), POLLIN, 0}};
+        std::vector<pollfd> p = {{sig_fd, POLLIN, 0}, {control.listen_fd(), POLLIN, 0}, {control.owner_fd(), POLLIN, 0},
+                                 {producer.ready_fd(), POLLIN, 0}};
+        feed.poll_fds(&p);   /* one per target's renderer connection */
         /* A decoded frame wakes it (the producer's ready fd), and so does the
-         * renderer's socket; four times a second otherwise, so the client
-         * retries its connection, a source that is down is retried and the
-         * status files stay current. */
-        int n = poll(p, 5, 250);
+         * renderer's socket, and the HUD's next frame when one is due; four
+         * times a second otherwise, so the client retries its connection, a
+         * source that is down is retried and the status files stay current. */
+        const int64_t hud_wake = feed.wake_in_ms(now_ms());
+        int n = poll(p.data(), p.size(), hud_wake >= 0 && hud_wake < 250 ? (int)hud_wake : 250);
         if (n < 0 && errno != EINTR)
             break;
         if (p[0].revents & POLLIN)
@@ -268,8 +304,13 @@ int serve(const Config &cfg)
             control.on_listen_readable();
         const int64_t now = now_ms();
         uint64_t id = 0;
-        if (producer.take(&frame, &id))
-            feed.offer(&frame, id, now);
+        bool same = false;
+        if (producer.take(&frame, &id, &same)) {
+            if (same)
+                feed.repeat(id, now);
+            else
+                feed.offer(&frame, id, now);
+        }
         if (now - alt_read_ms >= 1000) {
             const AltScreen::State s = cfg.num("alt_screen_port") ? alt.read() : AltScreen::Unknown;
             if (s != alt_state)
@@ -280,6 +321,7 @@ int serve(const Config &cfg)
         }
         const bool live = liveness.live(alt_state, producer.last_frame_ms(), now);
         producer.set_live(live, now);
+        producer.set_pictures(feed.wants_frames());
         feed.set_stream(live, producer.frozen(now), producer.picture(now));
         feed.poll(now);
         producer.retry_sources(now);
@@ -295,14 +337,17 @@ int serve(const Config &cfg)
             FrameTally::Minute m;
             StreamHealth::Minute sm;
             Backlog::Minute bm;
+            FrameTiming::Minute tm;
             uint64_t overflows = 0;
-            if (producer.minute(now, &m, &sm, &bm, &overflows))
+            if (producer.minute(now, &m, &sm, &bm, &tm, &overflows)) {
                 log_info("waze: %u frames decoded in the last minute, %u without a picture to catch up, %u changed, "
                          "%u corrupted; the last picture is %s; %u losses (%u packets), %llu dropped by the receive "
                          "queue; packets waited %.1f ms on average, %lld ms at most",
                          m.frames + bm.skipped, bm.skipped, m.changed, sm.corrupted, m.blank ? "blank" : "not blank",
                          sm.losses, sm.lost, (unsigned long long)overflows, bm.wait_us.mean() / 1000.0,
                          (long long)(bm.wait_us.max / 1000));
+                log_info("waze: %s", FrameTiming::describe(tm).c_str());
+            }
             producer.track_keyframe_wait(now);
             const std::string detail = producer.stream_detail();
             if (producer.stream_lost() && detail != last_detail)
@@ -371,7 +416,7 @@ bool load_local(Config *cfg, std::string *err)
 void usage()
 {
     std::fprintf(stderr,
-                 "usage: waze-on-cluster [-c FILE] [-s key=value]... [run sail|map|panel|hud | bench-pack I420_FILE]\n");
+                 "usage: waze-on-cluster [-c FILE] [-s key=value]... [run sail|map|panel | bench-pack I420_FILE]\n");
 }
 
 /* Times pan_blocks' packing (4:2:0 to RGB and the block fit) of each
@@ -447,9 +492,20 @@ void define_keys(Config *cfg)
     cfg->define("target_fps", "30");
     cfg->define("pan_blocks", "1");
     cfg->define("tex_level_bits", "2");
+    cfg->define("gpu_copy", "1");
     cfg->define("target", "map");
     cfg->define("hide_bmw_guidance", "1");
     cfg->define("state_file", "/var/opt/waze-on-cluster/state/waze-on-cluster.state.conf");
+    cfg->define("map_state_file", "/var/opt/waze-on-cluster/map.state.conf");
+    cfg->define("cluster", "1");
+    cfg->define("hud", "0");
+    cfg->define("hud_fps", "10");
+    cfg->define("hud_width_pct", "0");
+    cfg->define("hud_offset_x", "0");
+    cfg->define("hud_offset_y", "0");
+    cfg->define("hud_scale_down", "1");
+    cfg->define("hud_round_corners", "1");
+    cfg->define("hud_black_background", "1");
     cfg->define("render_socket", "/dev/shm/cluster-render/render.sock");
     cfg->define("log_file", "/var/opt/waze-on-cluster/log/waze-on-cluster.log");
     cfg->define("log_file_kb", "512");
@@ -478,8 +534,11 @@ int main(int argc, char **argv)
     log_verbose = (int)cfg.num("verbose");
     signal(SIGPIPE, SIG_IGN);
 
-    if (i == argc)
-        return serve(cfg);
+    if (i == argc) {
+        /* Before any source, decoder or renderer connection. */
+        const std::string why = head_unit_refused();
+        return why.empty() ? serve(cfg) : serve_refused(cfg, why);
+    }
     if (i + 2 == argc && !std::strcmp(argv[i], "run"))
         return run(cfg, argv[i + 1]);
     if (i + 2 == argc && !std::strcmp(argv[i], "bench-pack"))

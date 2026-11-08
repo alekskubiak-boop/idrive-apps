@@ -10,7 +10,7 @@
 #   make test                 every host test: the kit, slot arbitration, the
 #                             RAMSES console reader, the upload governor, the
 #                             stack, layers and compositor
-#                             on a fake renderer, the service over its socket
+#                             on a fake renderer, the receive buffer, the service over its socket
 #                             with the C++ client, and the Node client
 #   make test-kit             the kit's tests alone (for producers that link it)
 #   make test-x86             the C++ tests built and run with the unit's
@@ -52,14 +52,14 @@ T = $(BUILD)/target
 H = $(BUILD)/host
 
 KIT_SRC  = kit/dirty_tiles.cpp kit/yuv_atlas.cpp kit/block_pack.cpp
-CORE_SRC = src/slots.cpp src/guard.cpp src/governor.cpp src/stack.cpp src/layer.cpp src/video_layer.cpp src/mesh_layer.cpp \
+CORE_SRC = src/slots.cpp src/guard.cpp src/governor.cpp src/stack.cpp src/recv_buffer.cpp src/layer.cpp src/video_layer.cpp src/mesh_layer.cpp \
            src/asset.cpp src/compositor.cpp \
            src/server.cpp src/service.cpp src/dcsm2_port.cpp src/dcsm27_port.cpp src/ramses_console.cpp \
            client/protocol.cpp src/log.cpp
 CORE_H   = $(wildcard src/*.h kit/*.h include/cluster_render/*.h)
-UNIT_SRC = src/main.cpp src/holds.cpp src/unit_idrive7.cpp src/graph_ramses19.cpp src/dcsm2_link.cpp src/config.cpp dcsm/dcsm_client.cpp
-UNIT8_SRC = src/main.cpp src/holds.cpp src/unit_idrive8.cpp src/graph_ramses27.cpp src/config.cpp
-LAUNCH_SRC = src/main.cpp src/holds.cpp src/launch.cpp src/generation.cpp src/config.cpp client/protocol.cpp src/log.cpp
+UNIT_SRC = src/main.cpp src/head_unit.cpp src/refused.cpp src/holds.cpp src/unit_idrive7.cpp src/graph_ramses19.cpp src/dcsm2_link.cpp src/config.cpp dcsm/dcsm_client.cpp
+UNIT8_SRC = src/main.cpp src/head_unit.cpp src/refused.cpp src/holds.cpp src/unit_idrive8.cpp src/graph_ramses27.cpp src/config.cpp
+LAUNCH_SRC = src/main.cpp src/head_unit.cpp src/refused.cpp src/holds.cpp src/launch.cpp src/generation.cpp src/config.cpp client/protocol.cpp src/log.cpp
 CLIENT_SRC = client/client.cpp client/protocol.cpp
 
 .PHONY: all test test-cpp test-js test-kit test-kit-bin test-x86 test-x86-in-docker test-kit-x86 image target target-in-docker \
@@ -68,7 +68,7 @@ CLIENT_SRC = client/client.cpp client/protocol.cpp
 KIT_TESTS = $(H)/map_upload_test $(H)/yuv_atlas_test $(H)/frame_clock_test $(H)/block_pack_test
 CPP_TESTS = $(H)/log_test $(H)/slots_test $(H)/governor_test $(H)/compositor_test $(H)/service_test \
 	$(H)/dcsm2_port_test $(H)/ramses_console_test $(H)/dcsm27_port_test $(H)/generation_test $(H)/holds_test \
-	$(H)/guard_test $(H)/config_test
+	$(H)/guard_test $(H)/head_unit_test $(H)/refused_test $(H)/recv_buffer_test $(H)/config_test
 
 all: test
 
@@ -88,6 +88,9 @@ test-cpp: $(CPP_TESTS)
 	$(H)/generation_test
 	$(H)/holds_test
 	$(H)/guard_test
+	$(H)/head_unit_test test/head_unit_cases.jsonl
+	$(H)/refused_test $(H)/cluster-render
+	$(H)/recv_buffer_test
 	$(H)/config_test
 	$(H)/service_test
 
@@ -160,11 +163,24 @@ $(H)/dcsm27_port_test: $(O)/test/dcsm27_port_test.o $(O)/src/dcsm27_port.o $(O)/
 $(H)/generation_test: $(O)/test/generation_test.o $(O)/src/generation.o
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
+$(H)/head_unit_test: $(O)/test/head_unit_test.o $(O)/src/head_unit.o $(O)/client/protocol.o
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+# The launcher on the host: what it does before it starts a generation's service.
+$(H)/cluster-render: $(addprefix $(O)/,$(LAUNCH_SRC:.cpp=.o))
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+$(H)/refused_test: $(O)/test/refused_test.o $(O)/client/protocol.o $(H)/cluster-render
+	$(CXX) $(CXXFLAGS) -o $@ $(O)/test/refused_test.o $(O)/client/protocol.o
+
 $(H)/holds_test: $(O)/test/holds_test.o $(O)/src/holds.o
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
 $(H)/guard_test: $(O)/test/guard_test.o $(O)/src/guard.o $(O)/src/log.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
+
+$(H)/recv_buffer_test: $(O)/test/recv_buffer_test.o $(O)/src/recv_buffer.o $(O)/client/protocol.o
+	$(CXX) $(CXXFLAGS) -o $@ $^
 
 $(H)/config_test: $(O)/test/config_test.o $(O)/src/config.o
 	$(CXX) $(CXXFLAGS) -o $@ $^

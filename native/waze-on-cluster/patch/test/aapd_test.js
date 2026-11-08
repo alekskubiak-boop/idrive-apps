@@ -4,16 +4,22 @@
 // Copyright (C) 2026 Robert Nisipeanu
 /* The Android Auto patch end to end on temporary copies of the unit's aapd
  * (AAPD_BIN, aapd 22.39.3) and aapd.conf (AAPD_CONF): the patcher's
- * refusals (coding, build, every anchor, a conf something else changed, a
- * backup that is not its record's, too little space), its byte-exact undo
- * without anchors, patchd's hooks and socket next to carplay's (CARPLAY_BIN,
- * optional), the head-unit restart guard, and boot recovery for aapd with /,
- * /proc, mount and systemctl faked. Firmware is never in this repository;
- * without AAPD_BIN and AAPD_CONF the test skips.
+ * refusals (coding, a site not found, a modified proven build, a build
+ * outside the proven list without --unproven, an aapd.conf without what
+ * the edit needs or changed by something else, a backup that is not its
+ * record's, too little space), a build outside the proven list patched with
+ * --unproven, its byte-exact undo without the locator, patchd's hooks and
+ * socket next to carplay's (CARPLAY_BIN, optional), the head-unit restart
+ * guard, and boot recovery for aapd with /, /proc, mount and systemctl
+ * faked. The build outside the proven list is the reference with its GNU
+ * build-id changed. Firmware is never in this repository; without AAPD_BIN
+ * and AAPD_CONF the test skips.
  *
  *   AAPD_BIN=<aapd> AAPD_CONF=<aapd.conf> [CARPLAY_BIN=<carplay>] node aapd_test.js
  */
 'use strict';
+
+var headUnit = require('./head_unit_env.js');   /* a HIGH head unit for every patcher and patchd this runs */
 
 var fs = require('fs');
 var os = require('os');
@@ -28,7 +34,18 @@ if (!fs.existsSync(BIN) || !fs.existsSync(CONF)) { process.stdout.write('SKIP: s
 
 var ap = require('../aapd_patch.js');
 var conf = require('../aapd_conf.js');
+var locator = require('../aapd_locate.js');
 var SRC = fs.readFileSync(BIN), SRCCONF = fs.readFileSync(CONF);
+var LOC = locator.locate(SRC);
+if (!LOC.ok) { process.stdout.write('FAIL AAPD_BIN is not located: ' + LOC.reason + '\n'); process.exit(1); }
+var REGIONS = locator.EDITS.map(function (e) { return [LOC[e].offset, LOC[e].len]; });
+/* The reference with its GNU build-id changed: a build outside the proven
+ * list whose sites the locator finds. */
+var UNPROVEN = (function () {
+    var b = Buffer.from(SRC), id = require('../carplay_locate.js').buildId(SRC), at = b.indexOf(Buffer.from(id, 'hex'));
+    b[at] ^= 0xff;
+    return b;
+})();
 var fails = 0, dirs = [], children = [];
 function ok(name, cond, detail) {
     process.stdout.write((cond ? 'ok   ' : 'FAIL ') + name + (detail !== undefined && !cond ? '  — ' + detail : '') + '\n');
@@ -50,12 +67,14 @@ function coding(v, flags) {
 }
 
 /* A fresh unit: aapd, aapd.conf, the coding, a df reporting plenty. */
-function unit() {
+function unit(bin) {
     var d = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-aa-'));
     dirs.push(d);
     var t = { d: d, bin: path.join(d, 'aapd'), conf: path.join(d, 'aapd.conf'), coding: path.join(d, 'coding'), df: path.join(d, 'df') };
-    fs.writeFileSync(t.bin, SRC, { mode: 0o755 });
-    fs.writeFileSync(t.conf, SRCCONF, { mode: 0o644 });
+    fs.writeFileSync(t.bin, bin || SRC);
+    fs.chmodSync(t.bin, 0o755);
+    fs.writeFileSync(t.conf, SRCCONF);
+    fs.chmodSync(t.conf, 0o644);
     fs.writeFileSync(t.coding, coding(7));
     setFree(t, 1 << 30);
     return t;
@@ -70,14 +89,57 @@ function patcher(t, args) {
     return { code: r.status, out: r.stdout + r.stderr };
 }
 function status(t) { return patcher(t, ['status']).out; }
-function untouched(t) { return sha(t.bin) === sha(SRC) && sha(t.conf) === sha(SRCCONF) && !fs.existsSync(t.bin + '.woc-orig') && !fs.existsSync(t.conf + '.woc-orig'); }
+function untouchedAs(t, bin) { return sha(t.bin) === sha(bin) && sha(t.conf) === sha(SRCCONF) && !fs.existsSync(t.bin + '.woc-orig') && !fs.existsSync(t.conf + '.woc-orig'); }
+function untouched(t) { return untouchedAs(t, SRC); }
+/* An untested aapd that aapd.service does not start. */
+function foreignAapd(u) {
+    fs.writeFileSync(u.bin, UNPROVEN);
+    fs.mkdirSync(path.join(u.d, 'units', 'aapd.service.d'));
+    fs.writeFileSync(path.join(u.d, 'units', 'aapd.service.d', 'x.conf'), '[Service]\nExecStart=\nExecStart=/opt/other/aapd\n');
+}
+/* aapd_patch.js status slowed to 3 s in the patchd of unit u. */
+function slowStatus(u) {
+    var js = path.join(u.d, 'slow-status.js');
+    fs.writeFileSync(js, 'if (/aapd_patch\\.js$/.test(process.argv[1] || "") && process.argv[2] === "status") { var t = Date.now() + 3000; while (Date.now() < t); }\n');
+    u.env.NODE_OPTIONS = '--require=' + js;
+}
 function onlyEdits(a, b) {
     for (var i = 0; i < a.length; i++) {
         if (a[i] === b[i]) continue;
-        if (!ap.EDITS.some(function (e) { return i >= e.off && i < e.off + e.original.length / 2; })) return false;
+        if (!REGIONS.some(function (r) { return i >= r[0] && i < r[0] + r[1]; })) return false;
     }
     return a.length === b.length;
 }
+
+/* ---- modes under umask 077: aapd runs as cia_13006 ---- */
+(function modeTests() {
+    var mask = process.umask(0o077);
+    function mode(f) { return fs.statSync(f).mode & 0o7777; }
+    function modes(t) { return mode(t.bin).toString(8) + ' ' + mode(t.conf).toString(8); }
+    try {
+        var t = unit(), owner = fs.statSync(t.bin);
+        var r = patcher(t, ['apply', '--yes']);
+        ok('umask 077: apply writes aapd 0755 and aapd.conf 0644, owner kept; the records keep the originals\' modes',
+            r.code === 0 && modes(t) === '755 644' && fs.statSync(t.bin).uid === owner.uid && fs.statSync(t.bin).gid === owner.gid &&
+            JSON.parse(fs.readFileSync(t.bin + '.woc-orig.json', 'utf8')).mode === 0o755 && JSON.parse(fs.readFileSync(t.conf + '.woc-orig.json', 'utf8')).mode === 0o644,
+            r.out + ' ' + modes(t));
+        fs.chmodSync(t.bin, 0o700); fs.chmodSync(t.conf, 0o600);
+        ok('umask 077: an apply with nothing to change refuses to set the modes without --yes', patcher(t, ['apply']).code === 1 && modes(t) === '700 600');
+        r = patcher(t, ['apply', '--yes']);
+        ok('umask 077: an apply with nothing to change sets aapd 0755 and aapd.conf 0644', r.code === 0 && modes(t) === '755 644', r.out + ' ' + modes(t));
+        fs.chmodSync(t.bin, 0o700); fs.chmodSync(t.conf, 0o600);
+        fs.writeFileSync(t.bin + '.woc-tmp', 'cut short', { mode: 0o600 });
+        r = patcher(t, ['revert', '--yes']);
+        ok('umask 077: revert over 0700/0600 and a stale temporary file writes the originals at 0755 and 0644', r.code === 0 && sha(t.bin) === sha(SRC) &&
+            sha(t.conf) === sha(SRCCONF) && modes(t) === '755 644' && !fs.existsSync(t.bin + '.woc-tmp'), r.out + ' ' + modes(t));
+        fs.chmodSync(t.bin, 0o700); fs.chmodSync(t.conf, 0o600);
+        r = patcher(t, ['revert', '--yes']);
+        ok('umask 077: revert of the originals at 0700/0600 sets 0755 and 0644, bytes untouched', r.code === 0 && sha(t.bin) === sha(SRC) && modes(t) === '755 644', r.out + ' ' + modes(t));
+        fs.chmodSync(t.bin, 0o555); fs.chmodSync(t.conf, 0o444);
+        r = patcher(t, ['revert']);
+        ok('originals at 0555/0444, which aapd\'s user can run and read, keep their modes', r.code === 0 && modes(t) === '555 444', r.out + ' ' + modes(t));
+    } finally { process.umask(mask); }
+})();
 
 /* ---- the patcher ---- */
 (function patcherTests() {
@@ -97,31 +159,38 @@ function onlyEdits(a, b) {
     fs.unlinkSync(nc.coding);
     ok('coding: an unreadable coding refuses', patcher(nc, ['apply', '--yes']).code === 1 && untouched(nc));
 
-    /* Every anchor and site, perturbed the way another build differs: refused
-     * with the edit's name, nothing written. */
-    ap.EDITS.forEach(function (e) {
-        [['before', e.off - 1], ['after', e.off + e.original.length / 2], ['site', e.off]].forEach(function (m) {
-            var u = unit(), b = Buffer.from(SRC);
-            b[m[1]] ^= 0x5a;
-            fs.writeFileSync(u.bin, b);
-            var r = patcher(u, ['apply', '--yes']);
-            ok('mutation: ' + e.name + ' ' + m[0] + ' changed is refused', r.code === 1 && r.out.indexOf(e.name) >= 0 && sha(u.bin) === sha(b) &&
-                !fs.existsSync(u.bin + '.woc-orig'), r.out);
-        });
+    /* A site the locator does not find (aapd_locate_test.js perturbs each):
+     * refused with the reason, nothing written. */
+    var nf = unit(), nb = Buffer.from(SRC);
+    nb[LOC.gate.offset + 6] = 3;
+    fs.writeFileSync(nf.bin, nb);
+    var r = patcher(nf, ['apply', '--unproven', '--yes']);
+    ok('a site not found: refused with the reason, nothing written', r.code === 1 && /refusing: gate: variant check not found/.test(r.out) &&
+        sha(nf.bin) === sha(nb) && !fs.existsSync(nf.bin + '.woc-orig'), r.out);
+    ok('a site not found: status says which', /known:\s+NO — gate: variant check not found/.test(status(nf)) && /gate:\s+UNKNOWN/.test(status(nf)), status(nf));
+    [['bytes appended', Buffer.concat([SRC, Buffer.alloc(16)])], ['a byte changed outside the sites', (function () { var b = Buffer.from(SRC); b[0x1000] ^= 1; return b; })()]].forEach(function (m) {
+        var u = unit(m[1]), x = patcher(u, ['apply', '--unproven', '--yes']);
+        ok('the proven build with ' + m[0] + ': refused (first edit needs the pristine build), also with --unproven', x.code === 1 && /pristine build: sha256/.test(x.out) &&
+            !fs.existsSync(u.bin + '.woc-orig'), x.out);
+        ok('the proven build with ' + m[0] + ': status reads modified, nothing restorable', /known:\s+yes, modified build/.test(status(u)) && /restorable:\s+no/.test(status(u)));
     });
-    var sz = unit();
-    fs.writeFileSync(sz.bin, Buffer.concat([SRC, Buffer.alloc(16)]));
-    ok('mutation: another size is refused', /refusing: size/.test(patcher(sz, ['apply', '--yes']).out) && !fs.existsSync(sz.bin + '.woc-orig'));
-    var un = unit(), ub = Buffer.from(SRC);
-    ub[0x1000] ^= 1;
-    fs.writeFileSync(un.bin, ub);
-    var r = patcher(un, ['apply', '--yes']);
-    ok('unproven: sites intact but another file is refused (first edit needs the pristine build)', r.code === 1 && /pristine build/.test(r.out) && !fs.existsSync(un.bin + '.woc-orig'), r.out);
-    ok('unproven: status reads modified, nothing restorable', /known:\s+yes, modified build/.test(status(un)) && /restorable:\s+no/.test(status(un)));
+    var text = SRCCONF.toString('utf8');
+    [['not JSON', text.slice(0, -10), /not JSON/],
+     ['a number the edit sets missing', text.replace(/"SA_WIDTHPIXELS": 612/, '"SA_WIDTHPIXELS": "612"'), /no number SCREENS\/KOMBI_DISPLAY\/DIMENSIONS\/12\.3\/SA_WIDTHPIXELS/],
+     ['two codecs for the 12.3" screen', text.replace(/"HIGH_1080P"\s*\]/, '"HIGH_1080P", "MID_1080P"]'), /no single codec for the 12\.3 screen/],
+     ['a key twice', text.replace(/"FRAME_RATE"/, '"CODEC_WIDTH"'), /twice/],
+     ['our geometry without our backup', conf.transform(text, 200, 'shown'), /holds our geometry without our backup/]].forEach(function (c) {
+        var u = unit();
+        fs.writeFileSync(u.conf, c[1]);
+        var x = patcher(u, ['apply', '--yes']);
+        ok('conf with ' + c[0] + ': refused before anything is written', x.code === 1 && c[2].test(x.out) && sha(u.bin) === sha(SRC) && !fs.existsSync(u.bin + '.woc-orig'), x.out);
+        ok('conf with ' + c[0] + ': status says why', new RegExp('geometry:\\s+UNKNOWN \\(').test(status(u)) && c[2].test(status(u)), status(u));
+    });
     var cc = unit();
     fs.appendFileSync(cc.conf, '\n');
     r = patcher(cc, ['apply', '--yes']);
-    ok('conf: another aapd.conf is refused before anything is written', r.code === 1 && /not the known original aapd.conf/.test(r.out) && sha(cc.bin) === sha(SRC), r.out);
+    ok('conf: an aapd.conf with what the edit needs is edited, whatever else it holds', r.code === 0 &&
+        conf.edited(SRCCONF.toString('utf8') + '\n', fs.readFileSync(cc.conf, 'utf8')) !== null, r.out);
     var lo = unit();
     setFree(lo, 10 << 20);
     r = patcher(lo, ['apply', '--yes']);
@@ -179,7 +248,7 @@ function onlyEdits(a, b) {
      * older release's edit there), and aapd.conf with KOMBI_DISPLAY numbers
      * no geometry of ours writes. */
     var pb = fs.readFileSync(t.bin);
-    pb[ap.EDITS[0].off - 1] ^= 0x5a;
+    pb[LOC.gate.offset - 1] ^= 0x5a;
     fs.writeFileSync(t.bin, pb);
     var pc = JSON.parse(fs.readFileSync(t.conf, 'utf8'));
     fs.writeFileSync(t.conf, fs.readFileSync(t.conf, 'utf8').replace('"SA_OFFSET_TOPPIXELS": ' + pc.SCREENS.KOMBI_DISPLAY.DIMENSIONS['12.3'].SA_OFFSET_TOPPIXELS, '"SA_OFFSET_TOPPIXELS": 7'));
@@ -188,17 +257,29 @@ function onlyEdits(a, b) {
     r = patcher(t, ['revert', '--yes']);
     ok('undo: revert writes both originals byte-exact', r.code === 0 && sha(t.bin) === sha(SRC) && sha(t.conf) === sha(SRCCONF), r.out);
 
-    /* A backup that is not its record's original is never trusted. */
+    /* A backup that is not its record's original is never trusted: on a
+     * build outside the proven list aapd is then not undone; the proven
+     * build is rebuilt from its own bytes. */
+    var ub = unit(UNPROVEN);
+    patcher(ub, ['apply', '--unproven', '--yes']);
+    var bad = fs.readFileSync(ub.bin + '.woc-orig');
+    bad[5] ^= 1;
+    fs.writeFileSync(ub.bin + '.woc-orig', bad);
+    var patched = sha(ub.bin);
+    ok('backup: one that differs from its record refuses apply', patcher(ub, ['apply', '--dpi', '200', '--yes']).code === 1);
+    r = patcher(ub, ['revert', '--yes']);
+    ok('backup: revert never writes it, restores aapd.conf on its own and fails: aapd is not undone', r.code === 1 && /recorded/.test(r.out) && /not undone: aapd untrusted, aapd\.conf original/.test(r.out) && sha(ub.bin) === patched && sha(ub.conf) === sha(SRCCONF), r.out);
+    r = patcher(ub, ['revert', '--yes']);
+    ok('backup: with nothing else to restore, revert fails and says why', r.code === 1 && /recorded/.test(r.out) && /restorable:\s+no \(backup sha256/.test(status(ub)), r.out);
     patcher(t, ['apply', '--yes']);
-    var bad = fs.readFileSync(t.bin + '.woc-orig');
+    bad = fs.readFileSync(t.bin + '.woc-orig');
     bad[5] ^= 1;
     fs.writeFileSync(t.bin + '.woc-orig', bad);
-    var patched = sha(t.bin);
-    ok('backup: one that differs from its record refuses apply', patcher(t, ['apply', '--dpi', '200', '--yes']).code === 1);
+    s = status(t);
+    ok('backup not its record\'s, on the proven build: restorable from its shipped bytes', /^restorable:\s+yes$/m.test(s) && /^undo:\s+aapd restorable, aapd\.conf restorable$/m.test(s), s);
     r = patcher(t, ['revert', '--yes']);
-    ok('backup: revert never writes it, restores aapd.conf on its own and fails: aapd is not undone', r.code === 1 && /recorded/.test(r.out) && /not undone: aapd untrusted, aapd\.conf original/.test(r.out) && sha(t.bin) === patched && sha(t.conf) === sha(SRCCONF), r.out);
-    r = patcher(t, ['revert', '--yes']);
-    ok('backup: with nothing else to restore, revert fails and says why', r.code === 1 && /recorded/.test(r.out) && /restorable:\s+no \(backup sha256/.test(status(t)), r.out);
+    ok('backup not its record\'s, on the proven build: revert writes the shipped bytes, never the backup; both files byte-exact', r.code === 0 &&
+        /restored .*aapd from the proven file's shipped content/.test(r.out) && sha(t.bin) === sha(SRC) && sha(t.conf) === sha(SRCCONF), r.out);
     fs.writeFileSync(t.bin + '.woc-orig', SRC);
     patcher(t, ['revert', '--yes']);
     patcher(t, ['apply', '--yes']);
@@ -215,17 +296,139 @@ function onlyEdits(a, b) {
     ok('another build: --force writes the backup, --drop-backup drops both', r.code === 0 && sha(t.bin) === sha(SRC) && !fs.existsSync(t.bin + '.woc-orig') &&
         !fs.existsSync(t.conf + '.woc-orig') && !fs.existsSync(t.bin + '.woc-orig.json'), r.out);
 
+    /* A build outside the proven list: patched only with --unproven, then
+     * like a proven one; undone byte-exact. */
+    var u = unit(UNPROVEN);
+    s = status(u);
+    ok('unproven build: pristine by its sites, not proven, its build-id and version', /known:\s+yes, pristine build [0-9a-f]{40}/.test(s) && /proven:\s+no/.test(s) &&
+        /version:\s+22\.39\.3/.test(s) && /geometry:\s+ORIGINAL/.test(s), s);
+    r = patcher(u, ['apply', '--yes']);
+    ok('unproven build: apply without --unproven refuses, nothing written', r.code === 1 && /is not a proven build; pass --unproven/.test(r.out) && untouchedAs(u, UNPROVEN), r.out);
+    r = patcher(u, ['apply', '--unproven', '--yes']);
+    var ub = fs.readFileSync(u.bin);
+    ok('unproven build: apply --unproven writes the four edits only, with the backup', r.code === 0 && onlyEdits(UNPROVEN, ub) && !ub.equals(UNPROVEN) &&
+        sha(u.bin + '.woc-orig') === sha(UNPROVEN) && JSON.parse(fs.readFileSync(u.bin + '.woc-orig.json', 'utf8')).buildId === locator.locate(UNPROVEN).buildId, r.out);
+    ok('unproven build: the edits are the proven build\'s', locator.EDITS.every(function (e) { return ub.toString('hex', LOC[e].offset, LOC[e].offset + LOC[e].len) === LOC[e].patched; }));
+    r = patcher(u, ['apply', '--dpi', '200', '--yes']);
+    ok('unproven build: a later apply (our backup present) needs no --unproven', r.code === 0 && /PATCHED \(200 dpi/.test(status(u)), r.out);
+    s = status(u);
+    ok('unproven build: status patched, restorable', (s.match(/PATCHED/g) || []).length === 5 && /restorable:\s+yes/.test(s) && /known:\s+yes, modified build/.test(s), s);
+    r = patcher(u, ['revert', '--yes', '--drop-backup']);
+    ok('unproven build: revert restores both byte-exact and drops the backups', r.code === 0 && untouchedAs(u, UNPROVEN), r.out);
+
+    /* A locator that throws: status still prints every line, and revert
+     * restores both files without it. */
+    var th = unit();
+    patcher(th, ['apply', '--yes']);
+    var pre = path.join(th.d, 'throwing-locator.js');
+    fs.writeFileSync(pre, 'var p = require.resolve(' + JSON.stringify(path.join(PATCH, 'aapd_locate.js')) + ');\n' +
+        'require.cache[p] = { id: p, filename: p, loaded: true, exports: { locate: function () { throw new Error("boom"); } } };\n');
+    function throwing(args) {
+        var x = cp.spawnSync(process.execPath, ['-r', pre, path.join(PATCH, 'aapd_patch.js')].concat(args, ['--target', th.bin, '--conf', th.conf, '--coding', th.coding]),
+            { encoding: 'utf8', env: Object.assign({}, process.env, { WOC_DF: th.df }) });
+        return { code: x.status, out: x.stdout + x.stderr };
+    }
+    r = throwing(['status']);
+    ok('a throwing locator: status prints every line, restorable, the backup named', r.code === 0 &&
+        ['target', 'size', 'sha256', 'build-id', 'version', 'conf', 'coding', 'restorable', 'undo', 'known', 'proven', 'gate', 'selfstart-call', 'selfstart-guard', 'screen', 'geometry', 'backup']
+            .every(function (k) { return new RegExp('^' + k + ':', 'm').test(r.out); }) &&
+        /^restorable:\s+yes$/m.test(r.out) && /^known:\s+NO — locator failed: boom$/m.test(r.out) && /^gate:\s+UNKNOWN \(locator failed: boom\)$/m.test(r.out) &&
+        r.out.split('\n').some(function (l) { return /^backup:/.test(l) && l.indexOf(th.bin + '.woc-orig') > 0; }), r.out);
+    r = throwing(['revert', '--yes']);
+    ok('a throwing locator: revert restores both files byte-exact', r.code === 0 && sha(th.bin) === sha(SRC) && sha(th.conf) === sha(SRCCONF), r.out);
+
     /* An apply cut short: a temporary backup without its record. */
     var cut = unit();
     fs.writeFileSync(cut.bin + '.woc-orig.tmp', 'partial');
     r = patcher(cut, ['apply', '--yes']);
     ok('cut short: the next apply replaces the temporary files', r.code === 0 && !fs.existsSync(cut.bin + '.woc-orig.tmp') && sha(cut.bin + '.woc-orig') === sha(SRC), r.out);
-    var nr = unit();
-    patcher(nr, ['apply', '--yes']);
+    var nr = unit(UNPROVEN);
+    patcher(nr, ['apply', '--unproven', '--yes']);
     fs.unlinkSync(nr.bin + '.woc-orig.json');
     var nrBin = sha(nr.bin);
     r = patcher(nr, ['revert', '--yes']);
     ok('record: a backup without its record is not trusted', /has no record/.test(r.out) && sha(nr.bin) === nrBin && sha(nr.conf) === sha(SRCCONF), r.out);
+
+    /* No backup at all: the proven aapd and aapd.conf are rebuilt from
+     * their own content and the shipped mode, also under umask 077. */
+    var nb = unit();
+    patcher(nb, ['apply', '--dpi', '240', '--card', 'hidden', '--yes']);
+    [nb.bin, nb.conf].forEach(function (f) { fs.unlinkSync(f + '.woc-orig'); fs.unlinkSync(f + '.woc-orig.json'); });
+    fs.chmodSync(nb.bin, 0o700);
+    s = status(nb);
+    ok('no backup, the proven files patched: restorable', /^restorable:\s+yes$/m.test(s) && /^undo:\s+aapd restorable, aapd\.conf restorable$/m.test(s), s);
+    var um = cp.spawnSync('sh', ['-c', 'umask 077; exec "$0" "$@"', process.execPath, path.join(PATCH, 'aapd_patch.js'), 'revert', '--yes',
+        '--target', nb.bin, '--conf', nb.conf, '--coding', nb.coding], { encoding: 'utf8' });
+    ok('no backup: revert restores both byte-exact with the shipped modes under umask 077', um.status === 0 && sha(nb.bin) === sha(SRC) && sha(nb.conf) === sha(SRCCONF) &&
+        (fs.statSync(nb.bin).mode & 0o7777) === 0o755 && (fs.statSync(nb.conf).mode & 0o7777) === 0o644, um.stdout + um.stderr);
+    ok('no backup, the originals: nothing left to undo', /^undo:\s+aapd original, aapd\.conf original$/m.test(status(nb)) && /^restorable:\s+no/m.test(status(nb)), status(nb));
+    fs.chmodSync(nb.bin, 0o700);
+    r = patcher(nb, ['revert', '--yes']);
+    ok('the original aapd with another mode and no backup of ours: not restorable, revert leaves the mode', /^restorable:\s+no/m.test(status(nb)) &&
+        r.code === 0 && /nothing to do/.test(r.out) && (fs.statSync(nb.bin).mode & 0o7777) === 0o700 && sha(nb.bin) === sha(SRC), r.out);
+    /* Beside a backup of ours (Remove patch keeps it), the mode is ours to
+     * repair, and the repair is nothing for patchd to restart aapd for. */
+    var mb = unit();
+    patcher(mb, ['apply', '--yes']);
+    patcher(mb, ['revert', '--yes']);
+    fs.chmodSync(mb.bin, 0o700);
+    s = status(mb);
+    r = patcher(mb, ['revert', '--yes']);
+    ok('the original aapd with another mode beside our backup: restorable; revert sets 0755 and reports nothing to do', /^restorable:\s+yes$/m.test(s) &&
+        r.code === 0 && /^set \S+'s mode and owner \(it had mode 0700, not 0755\)$/m.test(r.out) && /nothing to do/.test(r.out) && !/^restored /m.test(r.out) &&
+        (fs.statSync(mb.bin).mode & 0o7777) === 0o755 && sha(mb.bin) === sha(SRC), s + r.out);
+    /* woc-patch.sh, the by-hand path: aa-status, and aa-revert with / read-write
+     * only around the write, on the proven files without backups. */
+    var wp = unit();
+    patcher(wp, ['apply', '--yes']);
+    [wp.bin, wp.conf].forEach(function (f) { fs.unlinkSync(f + '.woc-orig'); fs.unlinkSync(f + '.woc-orig.json'); });
+    fs.mkdirSync(path.join(wp.d, 'bin'));
+    fs.writeFileSync(path.join(wp.d, 'bin', 'mount'), '#!/bin/sh\necho "$*" >> "' + path.join(wp.d, 'mounts') + '"\n', { mode: 0o755 });
+    var wenv = Object.assign({}, process.env, { PATH: path.join(wp.d, 'bin') + path.delimiter + process.env.PATH, WOC_AAPD: wp.bin, WOC_AAPD_CONF: wp.conf, WOC_CODING: wp.coding });
+    var ws = cp.spawnSync('sh', [path.join(PATCH, 'woc-patch.sh'), 'aa-status'], { env: wenv, encoding: 'utf8' });
+    ok('woc-patch.sh aa-status: the status, restorable without backups', ws.status === 0 && /^restorable:\s+yes$/m.test(ws.stdout) && /^gate:\s+PATCHED$/m.test(ws.stdout), ws.stdout + ws.stderr);
+    ws = cp.spawnSync('sh', [path.join(PATCH, 'woc-patch.sh'), 'aa-revert'], { env: wenv, encoding: 'utf8' });
+    ok('woc-patch.sh aa-revert: both files byte-exact, / read-write then read-only', ws.status === 0 && sha(wp.bin) === sha(SRC) && sha(wp.conf) === sha(SRCCONF) &&
+        fs.readFileSync(path.join(wp.d, 'mounts'), 'utf8') === '-o remount,rw /\n-o remount,ro /\n', ws.stdout + ws.stderr);
+
+    /* No backup of ours: aapd.conf is rebuilt only from a geometry this tool
+     * writes. One another tool changed is left as it is, with nothing to
+     * undo. */
+    var fc = unit();
+    var foreign = SRCCONF.toString('utf8').replace('"SA_PHYSICALDENSITY": 208', '"SA_PHYSICALDENSITY": 211');
+    ok('foreign aapd.conf fixture differs in one KOMBI_DISPLAY number', foreign !== SRCCONF.toString('utf8'));
+    fs.writeFileSync(fc.conf, foreign);
+    s = status(fc);
+    ok('aapd.conf changed by another tool, no backup: geometry original, nothing to undo, not restorable', /^geometry:\s+ORIGINAL$/m.test(s) &&
+        /^undo:\s+aapd original, aapd\.conf none$/m.test(s) && /^restorable:\s+no/m.test(s), s);
+    r = patcher(fc, ['revert', '--yes']);
+    ok('aapd.conf changed by another tool, no backup: revert leaves it byte for byte', fs.readFileSync(fc.conf, 'utf8') === foreign && sha(fc.bin) === sha(SRC), r.out);
+    var gc = unit();
+    patcher(gc, ['apply', '--dpi', '260', '--card', 'hidden', '--yes']);
+    [gc.bin, gc.conf].forEach(function (f) { fs.unlinkSync(f + '.woc-orig'); fs.unlinkSync(f + '.woc-orig.json'); });
+    fs.writeFileSync(gc.bin, SRC);
+    s = status(gc);
+    ok('aapd.conf at a geometry of ours, no backup, aapd stock: aapd.conf restorable', /^undo:\s+aapd original, aapd\.conf restorable$/m.test(s) &&
+        /^restorable:\s+yes$/m.test(s), s);
+    r = patcher(gc, ['revert', '--yes']);
+    ok('aapd.conf at a geometry of ours, no backup: revert rebuilds the shipped file', r.code === 0 && sha(gc.conf) === sha(SRCCONF) && sha(gc.bin) === sha(SRC), r.out);
+    var fb = unit();
+    var foreignBin = Buffer.from(SRC);
+    Buffer.from('83bb1c02000003', 'hex').copy(foreignBin, 0x998bd);
+    fs.writeFileSync(fb.bin, foreignBin);
+    s = status(fb);
+    ok('aapd with a site changed by another tool, no backup: nothing to undo, not restorable', /^undo:\s+aapd none, aapd\.conf original$/m.test(s) &&
+        /^restorable:\s+no/m.test(s), s);
+    r = patcher(fb, ['revert', '--yes']);
+    ok('aapd with a site changed by another tool, no backup: revert leaves it byte for byte', fs.readFileSync(fb.bin).equals(foreignBin), r.out);
+
+    var nu = unit(UNPROVEN);
+    patcher(nu, ['apply', '--unproven', '--yes']);
+    fs.unlinkSync(nu.bin + '.woc-orig'); fs.unlinkSync(nu.bin + '.woc-orig.json');
+    var nuBin = sha(nu.bin);
+    r = patcher(nu, ['revert', '--yes']);
+    ok('no backup, a build outside the proven list: aapd left as it is, aapd.conf restored', sha(nu.bin) === nuBin && sha(nu.conf) === sha(SRCCONF) &&
+        /^undo:\s+aapd none, aapd\.conf original$/m.test(status(nu)), r.out + status(nu));
 })();
 
 /* ---- patchd: hooks and socket, next to carplay ---- */
@@ -241,7 +444,18 @@ function patchdUnit(opts) {
     t.mounts = path.join(d, 'mounts');
     fs.writeFileSync(t.mounts, '/dev/root / ext4 ro 0 0\n');
     var mount = path.join(d, 'bin', 'mount');
-    fs.writeFileSync(mount, '#!/bin/sh\ncase "$*" in *rw*) echo "/dev/root / ext4 rw 0 0" > "' + t.mounts + '";; *) echo "/dev/root / ext4 ro 0 0" > "' + t.mounts + '";; esac\n');
+    /* remount,ro fails while a process runs a file no name links any more,
+     * as the kernel refuses it. */
+    fs.writeFileSync(mount, '#!' + process.execPath + '\n' + [
+        "var fs = require('fs'), path = require('path'), a = process.argv.slice(2).join(' ');",
+        "var P = " + JSON.stringify(path.join(d, 'proc')) + ", M = " + JSON.stringify(t.mounts) + ";",
+        "if (/rw/.test(a)) fs.writeFileSync(M, '/dev/root / ext4 rw 0 0\\n');",
+        "else {",
+        "    var open = fs.readdirSync(P).some(function (p) { try { return fs.statSync(path.join(P, p, 'exe')).nlink <= 1; } catch (e) { return false; } });",
+        "    if (open) { process.stderr.write('mount: / is busy\\n'); process.exit(32); }",
+        "    fs.writeFileSync(M, '/dev/root / ext4 ro 0 0\\n');",
+        "}",
+    ].join('\n') + '\n');
     fs.chmodSync(mount, 0o755);
     /* systemctl: show answers from unit.json, start makes the unit active,
      * every call recorded. */
@@ -302,14 +516,23 @@ function ro(t) { return /\bro\b/.test(fs.readFileSync(t.mounts, 'utf8')); }
 
     /* Not supported, untested, absent: CarPlay is patched as ever. */
     [['coding 9', function (u) { fs.writeFileSync(u.coding, coding(9)); }, /not supported on this car \(KI_KOMBI_VARIANT 9\)/],
-     ['an untested aapd', function (u) { fs.writeFileSync(u.bin, Buffer.concat([SRC, Buffer.alloc(8)])); }, /untested aapd build/],
+     ['an untested aapd', function (u) { fs.writeFileSync(u.bin, UNPROVEN); }, /"conflict":"untested aapd build"/],
+     ['an aapd the locator refuses', function (u) { var b = Buffer.from(SRC); b[LOC.gate.offset + 6] = 3; fs.writeFileSync(u.bin, b); }, /not patchable: gate: variant check not found/],
+     ['the proven aapd modified', function (u) { fs.writeFileSync(u.bin, Buffer.concat([SRC, Buffer.alloc(8)])); }, /aapd was modified by something else/],
+     ['an aapd.conf without the 12.3" codec', function (u) { fs.writeFileSync(u.conf, SRCCONF.toString('utf8').replace(/"HIGH_1080P"\s*\]/, '"NONE"]')); }, /aapd\.conf not usable: no number/],
+     /* an untested build is the conflict only when nothing else stands */
+     ['an untested aapd and an aapd.conf without the 12.3" codec', function (u) {
+         fs.writeFileSync(u.bin, UNPROVEN);
+         fs.writeFileSync(u.conf, SRCCONF.toString('utf8').replace(/"HIGH_1080P"\s*\]/, '"NONE"]'));
+     }, /"conflict":"aapd\.conf not usable: no number/],
+     ['an untested aapd that aapd.service does not start', foreignAapd, /"conflict":"aapd\.service starts \/opt\/other\/aapd/],
      ['no aapd', function (u) { fs.unlinkSync(u.bin); }, /no Android Auto/]].forEach(function (c) {
         var u = patchdUnit();
         c[1](u);
-        var before = fs.existsSync(u.bin) ? sha(u.bin) : null;
+        var before = fs.existsSync(u.bin) ? sha(u.bin) : null, confBefore = sha(u.conf);
         var x = hook(u, 'activate');
         ok('activate with ' + c[0] + ': Android Auto left as it is, exit 0', x.code === 0 && c[2].test(JSON.stringify(x.result.aa)) &&
-            (before === null || sha(u.bin) === before) && sha(u.conf) === sha(SRCCONF) && !marker(u, 'aa-pending'), x.out);
+            (before === null || sha(u.bin) === before) && sha(u.conf) === confBefore && !marker(u, 'aa-pending'), x.out);
         if (HAVE_CP) ok('activate with ' + c[0] + ': CarPlay patched as ever', /map patch written/.test(x.result.status) && sha(u.carplay) !== sha(CARPLAY), JSON.stringify(x.result));
     });
 
@@ -353,6 +576,37 @@ function ro(t) { return /\bro\b/.test(fs.readFileSync(t.mounts, 'utf8')); }
     r = hook(late, 'deactivate');
     ok('deactivate once readable again: restored byte-exact', r.code === 0 && sha(late.bin) === sha(SRC) && sha(late.conf) === sha(SRCCONF), r.out);
 
+    /* A status cut short after its header (the patcher stopped before its
+     * edit lines) is not read whole: a removal is refused until one is. */
+    var cs = patchdUnit();
+    hook(cs, 'activate');
+    var cutJs = path.join(cs.d, 'cut-status.js');
+    fs.writeFileSync(cutJs, [
+        "var m = /(aapd|carplay)_patch\\.js$/.exec(process.argv[1] || '');",
+        "if (m && process.argv[2] === 'status' && process.env.WOC_CUT === m[1]) {",
+        "    var w = process.stdout.write.bind(process.stdout), cut = false;",
+        "    process.stdout.write = function (s) { if (cut) return true; if (/^proven:/.test(s)) { cut = true; if (process.env.WOC_CUT_EXIT) process.exitCode = 1; } return w(s); };",
+        "}"].join('\n') + '\n');
+    cs.env.NODE_OPTIONS = '--require=' + cutJs;
+    cs.env.WOC_CUT = 'aapd';
+    cs.env.WOC_CUT_EXIT = '';
+    r = hook(cs, 'deactivate');
+    ok('deactivate with aapd\'s status cut short, exit 0: refused, aapd still patched', r.code === 1 && /aapd status cut short/.test(JSON.stringify(r.result.aa)) &&
+        sha(cs.bin) !== sha(SRC), r.out);
+    cs.env.WOC_CUT_EXIT = '1';
+    r = hook(cs, 'deactivate');
+    ok('deactivate with aapd\'s status cut short, exit 1: refused, aapd still patched', r.code === 1 && /aapd status cut short/.test(JSON.stringify(r.result.aa)) &&
+        sha(cs.bin) !== sha(SRC), r.out);
+    if (HAVE_CP) {
+        cs.env.WOC_CUT = 'carplay';
+        r = hook(cs, 'deactivate');
+        ok('deactivate with carplay\'s status cut short: refused', r.code === 1 && /carplay status cut short/.test(JSON.stringify(r.result)), r.out);
+    }
+    cs.env.WOC_CUT = '';
+    r = hook(cs, 'deactivate');
+    ok('deactivate once both statuses read whole: done, aapd and aapd.conf byte-exact', r.code === 0 && sha(cs.bin) === sha(SRC) && sha(cs.conf) === sha(SRCCONF) &&
+        (!HAVE_CP || sha(cs.carplay) === sha(CARPLAY)), r.out);
+
     /* A firmware update replaced aapd under our backups: a removal leaves
      * it, as carplay's does; aapd.conf of ours is still restored. */
     var fw = patchdUnit();
@@ -384,15 +638,36 @@ function ro(t) { return /\bro\b/.test(fs.readFileSync(t.mounts, 'utf8')); }
     fs.rmdirSync(half.conf + '.woc-tmp');
     r = hook(half, 'deactivate');
     ok('deactivate once aapd.conf can be written: restored byte-exact', r.code === 0 && sha(half.bin) === sha(SRC) && sha(half.conf) === sha(SRCCONF), r.out);
+    /* No backups of ours: the proven aapd and aapd.conf are rebuilt and the
+     * removal passes; a build outside the proven list with our edits in it
+     * cannot be, and the removal is refused. */
+    var nbk = patchdUnit();
+    hook(nbk, 'activate');
+    [nbk.bin, nbk.conf].forEach(function (f) { fs.unlinkSync(f + '.woc-orig'); fs.unlinkSync(f + '.woc-orig.json'); });
+    r = hook(nbk, 'deactivate');
+    ok('deactivate with no backups, the proven files patched: both byte-exact, exit 0', r.code === 0 && sha(nbk.bin) === sha(SRC) && sha(nbk.conf) === sha(SRCCONF), r.out);
+    var nbu = patchdUnit();
+    fs.writeFileSync(nbu.bin, UNPROVEN);
+    patcher(nbu, ['apply', '--unproven', '--yes']);
+    fs.unlinkSync(nbu.bin + '.woc-orig'); fs.unlinkSync(nbu.bin + '.woc-orig.json');
+    var nbuBin = sha(nbu.bin);
+    r = hook(nbu, 'deactivate');
+    ok('deactivate with an untested aapd patched and its backup gone: refused, exit 1, our edits named, aapd as it was', r.code === 1 && sha(nbu.bin) === nbuBin &&
+        sha(nbu.conf) === sha(SRCCONF) && /Android Auto not undone \(aapd none, aapd\.conf original, our edits read in it\)/.test(JSON.stringify(r.result.aa)), r.out);
+
+    /* aapd.conf with a change of its own (not the shipped file, so not
+     * rebuilt from it) and its backup unrecorded. */
     var norec = patchdUnit();
+    fs.writeFileSync(norec.conf, SRCCONF.toString('utf8').replace(/"RACK_MODE"\s*:\s*\w+/, '"RACK_MODE": 1'));
+    var norecConf = sha(norec.conf);
     hook(norec, 'activate');
     fs.unlinkSync(norec.conf + '.woc-orig.json');
     r = hook(norec, 'deactivate');
     ok('deactivate with aapd.conf\'s backup unrecorded: refused, its backup kept', r.code === 1 && sha(norec.bin) === sha(SRC) &&
-        sha(norec.conf) !== sha(SRCCONF) && fs.existsSync(norec.conf + '.woc-orig') && /not undone/.test(JSON.stringify(r.result.aa)), r.out);
+        sha(norec.conf) !== norecConf && fs.existsSync(norec.conf + '.woc-orig') && /not undone/.test(JSON.stringify(r.result.aa)), r.out);
     var st = patcher(norec, ['revert', '--yes']);
     ok('the patcher\'s revert with aapd.conf unrecorded: exit non-zero', st.code !== 0 && /aapd\.conf/.test(st.out), st.out);
-    ok('status names what is left to undo', /^undo:\s+aapd none, aapd\.conf untrusted$/m.test(status(norec)), status(norec));
+    ok('status names what is left to undo', /^undo:\s+aapd original, aapd\.conf untrusted$/m.test(status(norec)), status(norec));
 })();
 
 /* patchd's socket: one connection, its status events and replies. */
@@ -447,6 +722,157 @@ async function socketTests() {
     st = await p.next(function (m) { return aaDone(m) && m.aa.aapd; });
     ok('aa-apply without recmgr\'s aapd entry: deferred, pending marker, no systemctl', st.aa.aapd === 'deferred' && st.aa.pending === 'apply' &&
         marker(t, 'aa-pending').action === 'apply' && !calls(t).some(function (l) { return /aapd/.test(l); }) && ro(t), JSON.stringify(st.aa) + calls(t).join(';'));
+    ok('a pending patch is removable', st.aa.removable === true, JSON.stringify(st.aa));
+
+    /* aapd restartable, its patch cut short after aapd was replaced (the
+     * aapd.conf write fails): aapd still runs the old file, kept named, and
+     * the change waits for its start; aapd is not restarted for it. */
+    var cut = patchdUnit({ recmgr: ['carplay', 'aapd'] });
+    fs.mkdirSync(path.join(cut.d, 'proc', '4343'));
+    fs.linkSync(cut.bin, path.join(cut.d, 'proc', '4343', 'exe'));
+    var cutIno = fs.statSync(cut.bin).ino;
+    fs.mkdirSync(cut.conf + '.woc-tmp');
+    var cp2 = await daemon(cut);
+    await cp2.next(function (m) { return m.ev === 'status'; });
+    cp2.send({ cmd: 'aa-apply' });
+    var cst = await cp2.next(function (m) { return aaDone(m) && (m.aa.error || m.aa.state === 'error' || m.aa.pending); });
+    await new Promise(function (r) { setTimeout(r, 500); });
+    cp2.send({ cmd: 'status' });
+    cst = await cp2.next(function (m) { return m.ev === 'status' && m.aa && m.aa.state !== 'busy'; });
+    ok('aapd restartable, the patch cut short after aapd was replaced: the change waits for its start, aapd not restarted, its file named, / read-only',
+        cst.aa.pending === 'apply' && (marker(cut, 'aa-pending') || {}).action === 'apply' && !calls(cut).some(function (l) { return /start aapd|aapd\.service/.test(l) && !/^systemctl show/.test(l); }) &&
+        fs.statSync(path.join(cut.d, 'proc', '4343', 'exe')).ino === cutIno && fs.statSync(cut.bin + '.woc-running').ino === cutIno &&
+        sha(cut.bin) !== sha(SRC) && sha(cut.conf) === sha(SRCCONF) && ro(cut), JSON.stringify(cst.aa) + ' ' + calls(cut).join(';'));
+    cp2.proc.kill('SIGKILL');
+    fs.rmdirSync(cut.conf + '.woc-tmp');
+
+    /* aapd.conf another tool changed, no backup of ours: patchd reports
+     * nothing to remove, and a removal of the tool leaves it as it is. */
+    var fu = patchdUnit({ recmgr: ['carplay'] });
+    var fuText = SRCCONF.toString('utf8').replace('"SA_PHYSICALDENSITY": 208', '"SA_PHYSICALDENSITY": 211');
+    fs.writeFileSync(fu.conf, fuText);
+    var fp = await daemon(fu);
+    var fst = await fp.next(function (m) { return m.ev === 'status' && m.aa && m.aa.state !== 'unknown'; });
+    ok('aapd.conf changed by another tool, no backup: Not patched and not removable', fst.aa.state === 'original' && fst.aa.removable === false, JSON.stringify(fst.aa));
+    fp.proc.kill('SIGKILL');
+    var fr = hook(fu, 'deactivate');
+    ok('aapd.conf changed by another tool, no backup: a removal leaves it byte for byte, exit 0', fr.code === 0 && fs.readFileSync(fu.conf, 'utf8') === fuText &&
+        sha(fu.bin) === sha(SRC) && !marker(fu, 'aa-pending'), fr.out);
+
+    /* Remove patch while that patch waits: the running aapd is the original,
+     * so both files are restored at once and nothing waits; then Patch again. */
+    var pend = patchdUnit({ recmgr: ['carplay'] });
+    fs.mkdirSync(path.join(pend.d, 'proc', '4242'));
+    fs.linkSync(pend.bin, path.join(pend.d, 'proc', '4242', 'exe'));
+    /* With the flag file, aapd starts again as a revert starts (a crash
+     * restart): its exe is the file the revert replaces. */
+    var crashFlag = path.join(pend.d, 'crash-restart'), crashJs = path.join(pend.d, 'crash-restart.js');
+    var crashWritten = path.join(pend.d, 'crash-written');
+    /* With crash-written, aapd starts again as the revert ends, before
+     * patchd puts its running file back: its exe is the file the revert wrote. */
+    fs.writeFileSync(crashJs, "var fs = require('fs'), F = " + JSON.stringify(crashFlag) + ", W = " + JSON.stringify(crashWritten) + ", E = " + JSON.stringify(path.join(pend.d, 'proc', '4242', 'exe')) + ";\n" +
+        "function start() { fs.unlinkSync(E); fs.linkSync(" + JSON.stringify(pend.bin) + ", E); }\n" +
+        "if (/aapd_patch\\.js$/.test(process.argv[1] || '') && process.argv[2] === 'revert') {\n" +
+        "  if (fs.existsSync(F)) { fs.unlinkSync(F); start(); }\n" +
+        "  process.on('exit', function () { if (fs.existsSync(W)) { fs.unlinkSync(W); start(); } });\n}\n");
+    function exeIno() { return fs.statSync(path.join(pend.d, 'proc', '4242', 'exe')).ino; }
+    function heldAa() { return ['', '.1', '.2'].filter(function (s) { return fs.existsSync(pend.bin + '.woc-running' + s); }); }
+    pend.env.NODE_OPTIONS = '--require=' + crashJs;
+    var pp = await daemon(pend);
+    await pp.next(function (m) { return m.ev === 'status'; });
+    pp.send({ cmd: 'aa-apply' });
+    st = await pp.next(function (m) { return aaDone(m) && m.aa.aapd; });
+    ok('Patch without recmgr\'s aapd entry: pending, the running aapd kept linked', st.aa.pending === 'apply' && fs.existsSync(pend.bin + '.woc-running'), JSON.stringify(st.aa));
+    pp.send({ cmd: 'aa-revert' });
+    st = await pp.next(function (m) { return aaDone(m) && m.aa.state === 'original'; });
+    ok('Remove patch of the pending patch: both files byte-exact at once, nothing pending, no marker, no link, not removable', !st.aa.pending && !st.aa.aapd &&
+        sha(pend.bin) === sha(SRC) && sha(pend.conf) === sha(SRCCONF) && !marker(pend, 'aa-pending') && !fs.existsSync(pend.bin + '.woc-running') &&
+        st.aa.removable === false, JSON.stringify(st.aa));
+    /* After a head-unit start runs the patch: a waiting revert, then aapd
+     * started again from the reverted files (what the revert's marker says
+     * aapd read is stale), then Patch and Remove patch: nothing waits. */
+    function aapdRuns(file) {
+        cp.execFileSync('rm', ['-rf', path.join(pend.d, 'proc', '4242')]);
+        fs.mkdirSync(path.join(pend.d, 'proc', '4242'));
+        fs.linkSync(file, path.join(pend.d, 'proc', '4242', 'exe'));
+    }
+    pp.send({ cmd: 'aa-apply' });
+    st = await pp.next(function (m) { return aaDone(m) && m.aa.pending === 'apply'; });
+    fs.unlinkSync(path.join(pend.shm, 'aa-pending'));
+    aapdRuns(pend.bin);
+    pp.send({ cmd: 'aa-revert' });
+    st = await pp.next(function (m) { return aaDone(m) && m.aa.pending === 'revert'; });
+    aapdRuns(pend.bin);
+    pp.send({ cmd: 'aa-apply' });
+    st = await pp.next(function (m) { return aaDone(m) && m.aa.pending === 'apply'; });
+    pp.send({ cmd: 'aa-revert' });
+    st = await pp.next(function (m) { return aaDone(m) && (m.aa.state === 'original' || m.aa.pending === 'revert'); });
+    ok('aapd started again after a waiting revert, then Patch and Remove patch: nothing waits, both files byte-exact', st.aa.state === 'original' && !st.aa.pending &&
+        sha(pend.bin) === sha(SRC) && sha(pend.conf) === sha(SRCCONF) && !marker(pend, 'aa-pending'), JSON.stringify(st.aa));
+    /* Remove patch of a waiting patch while aapd restarts from the patched
+     * file: aapd runs the patch, so the removal waits. */
+    pp.send({ cmd: 'aa-apply' });
+    st = await pp.next(function (m) { return aaDone(m) && m.aa.pending === 'apply'; });
+    var waitingIno = fs.statSync(pend.bin).ino;
+    fs.writeFileSync(crashFlag, '');
+    pp.send({ cmd: 'aa-revert' });
+    st = await pp.next(function (m) { return aaDone(m) && (m.aa.state === 'original' || m.aa.pending === 'revert' || m.aa.state === 'error'); });
+    ok('aapd restarted from the patch while its Remove patch ran: the removal waits for the start, both files byte-exact', st.aa.pending === 'revert' &&
+        (marker(pend, 'aa-pending') || {}).action === 'revert' && sha(pend.bin) === sha(SRC) && sha(pend.conf) === sha(SRCCONF), JSON.stringify(st.aa));
+    ok('... the patch aapd runs kept linked, no other name, / read-only, not Failed', st.aa.state !== 'error' && !st.aa.error && exeIno() === waitingIno &&
+        fs.statSync(pend.bin + '.woc-running').ino === waitingIno && heldAa().length === 1 && ro(pend), heldAa().join(',') + ' ' + JSON.stringify(st.aa));
+    try { fs.unlinkSync(path.join(pend.shm, 'aa-pending')); } catch (e) {}
+    aapdRuns(pend.bin);
+    ['', '.1', '.2'].forEach(function (s) { try { fs.unlinkSync(pend.bin + '.woc-running' + s); } catch (e) {} });
+    /* Remove patch of a waiting patch while aapd restarts from the file the
+     * revert wrote, before the put-back: that file stays linked, and the
+     * removal waits (aapd may have read aapd.conf before the revert did). */
+    pp.send({ cmd: 'aa-apply' });
+    st = await pp.next(function (m) { return aaDone(m) && m.aa.pending === 'apply'; });
+    fs.writeFileSync(crashWritten, '');
+    pp.send({ cmd: 'aa-revert' });
+    st = await pp.next(function (m) { return aaDone(m) && (m.aa.state === 'original' || m.aa.pending === 'revert' || m.aa.state === 'error'); });
+    ok('aapd restarted from the reverted file before the put-back: it stays linked, the removal waits, / read-only, both files byte-exact', st.aa.pending === 'revert' &&
+        st.aa.state !== 'error' && fs.readFileSync(path.join(pend.d, 'proc', '4242', 'exe')).equals(SRC) && fs.statSync(pend.bin + '.woc-running').ino === exeIno() &&
+        fs.statSync(pend.bin).ino !== exeIno() && heldAa().length === 1 && ro(pend) && sha(pend.bin) === sha(SRC) && sha(pend.conf) === sha(SRCCONF),
+        heldAa().join(',') + ' ' + JSON.stringify(st.aa));
+    try { fs.unlinkSync(path.join(pend.shm, 'aa-pending')); } catch (e) {}
+    aapdRuns(pend.bin);
+    ['', '.1', '.2'].forEach(function (s) { try { fs.unlinkSync(pend.bin + '.woc-running' + s); } catch (e) {} });
+    /* The same, with both extra names already holding files other processes
+     * run: no name is free for the written file, so it is not put back. It
+     * stays at the target, named, and the removal waits. */
+    pp.send({ cmd: 'aa-apply' });
+    st = await pp.next(function (m) { return aaDone(m) && m.aa.pending === 'apply'; });
+    [1, 2].forEach(function (i) {
+        fs.writeFileSync(pend.bin + '.woc-running.' + i, 'another program ' + i);
+        fs.mkdirSync(path.join(pend.d, 'proc', '500' + i));
+        fs.linkSync(pend.bin + '.woc-running.' + i, path.join(pend.d, 'proc', '500' + i, 'exe'));
+    });
+    fs.writeFileSync(crashWritten, '');
+    pp.send({ cmd: 'aa-revert' });
+    st = await pp.next(function (m) { return aaDone(m) && (m.aa.state === 'original' || m.aa.pending === 'revert' || m.aa.state === 'error'); });
+    ok('no name free for the written file: no put-back, it stays at the target, the removal waits, / read-only', st.aa.pending === 'revert' && st.aa.state !== 'error' &&
+        fs.statSync(pend.bin).ino === exeIno() && sha(pend.bin) === sha(SRC) && sha(pend.conf) === sha(SRCCONF) && ro(pend) &&
+        ['4242', '5001', '5002'].every(function (p) { return fs.statSync(path.join(pend.d, 'proc', p, 'exe')).nlink > 1; }),
+        heldAa().join(',') + ' ' + JSON.stringify(st.aa));
+    [1, 2].forEach(function (i) { cp.execFileSync('rm', ['-rf', path.join(pend.d, 'proc', '500' + i)]); });
+    try { fs.unlinkSync(path.join(pend.shm, 'aa-pending')); } catch (e) {}
+    aapdRuns(pend.bin);
+    ['', '.1', '.2'].forEach(function (s) { try { fs.unlinkSync(pend.bin + '.woc-running' + s); } catch (e) {} });
+    /* A waiting patch removed once aapd's restart entry is loaded: aapd
+     * runs the original already, so it is put back, not restarted. */
+    pp.send({ cmd: 'aa-apply' });
+    st = await pp.next(function (m) { return aaDone(m) && m.aa.pending === 'apply'; });
+    var recmgrTime = fs.statSync(pend.recmgr).mtime;
+    fs.writeFileSync(pend.recmgr, '[Whitelist]\ncarplay\naapd\n[WhitelistExitSuccess]\ncarplay\naapd\n');
+    fs.utimesSync(pend.recmgr, recmgrTime, recmgrTime);
+    pp.send({ cmd: 'aa-revert' });
+    st = await pp.next(function (m) { return aaDone(m) && (m.aa.state === 'original' || m.aa.pending === 'revert' || m.aa.state === 'error'); });
+    ok('Remove patch of a waiting patch with aapd restartable: put back, nothing waits, aapd not restarted', st.aa.state === 'original' && !st.aa.pending &&
+        !marker(pend, 'aa-pending') && !calls(pend).some(function (l) { return /aapd/.test(l); }) && sha(pend.bin) === sha(SRC), JSON.stringify(st.aa) + calls(pend).join(';'));
+    pp.proc.kill('SIGKILL');
+
     p.send({ cmd: 'aa-density', value: 155 });
     st = await p.next(function (m) { return m.ev === 'refused'; });
     ok('aa-density: a value off the steps is refused', /150-400/.test(st.reason), JSON.stringify(st));
@@ -465,10 +891,12 @@ async function socketTests() {
         spaced.aa.runDpi === null && marker(t, 'aa-pending').run === null, JSON.stringify(spaced.aa));
 
     /* Restart head unit: once, then refused, and refused again by a new patchd within 10 min. */
+    fs.writeFileSync(t.env.WOC_BOOT_ID, 'boot-R\n');
     p.send({ cmd: 'reboot' });
     var rb = await p.next(function (m) { return m.ev === 'reboot-reply'; });
     for (var i = 0; i < 250 && calls(t).indexOf('reboot') < 0; i++) await sleep(20);
     ok('reboot: a pending Android Auto change is enough; one reboot', rb.ok === true && calls(t).filter(function (l) { return l === 'reboot'; }).length === 1, JSON.stringify(rb));
+    ok('reboot: the boot it was asked in is recorded for boot recovery', fs.readFileSync(path.join(t.d, 'var', 'restart-requested'), 'utf8') === 'boot-R\n');
     p.send({ cmd: 'reboot' });
     rb = await p.next(function (m) { return m.ev === 'reboot-reply'; });
     ok('reboot: a second request is refused while the first runs', rb.ok === false && /already in progress/.test(rb.reason), JSON.stringify(rb));
@@ -492,6 +920,7 @@ async function socketTests() {
     rb = await pf.next(function (m) { return m.ev === 'reboot-reply' && m.ok === false; });
     var rec = JSON.parse(fs.readFileSync(path.join(f.d, 'var', 'reboots.json'), 'utf8')).at;
     ok('reboot: a failed reboot takes out its own record only, and can be asked again', rec.length === 0 || (rec.length === 1 && rec[0] === older), JSON.stringify(rec));
+    ok('reboot: a failed reboot leaves no restart for boot recovery', !fs.existsSync(path.join(f.d, 'var', 'restart-requested')));
     pf.send({ cmd: 'reboot' });
     rb = await pf.next(function (m) { return m.ev === 'reboot-reply'; });
     ok('reboot: after a failed reboot a new request is accepted', rb.ok === true, JSON.stringify(rb));
@@ -525,6 +954,89 @@ async function socketTests() {
     await pr.next(function (m) { return aaDone(m) && m.aa.state === 'original' || m.aa && m.aa.pending === 'revert'; });
     ok('aa-revert: originals back byte-exact, the crop override gone', sha(r.bin) === sha(SRC) && sha(r.conf) === sha(SRCCONF) && cropEnv(r) === null);
     pr.proc.kill('SIGKILL');
+
+    /* Android Auto's Patch button patches a build outside the proven list, which an
+     * install leaves. */
+    var un = patchdUnit();
+    fs.writeFileSync(un.bin, UNPROVEN);
+    var pu = await daemon(un);
+    st = await pu.next(function (m) { return m.ev === 'status'; });
+    ok('untested aapd: status original with the conflict', st.aa.state === 'original' && st.aa.conflict === 'untested aapd build', JSON.stringify(st.aa));
+    pu.send({ cmd: 'aa-apply' });
+    st = await pu.next(function (m) { return aaDone(m) && m.aa.aapd; });
+    ok('untested aapd: Patch patches it (--unproven), the conflict gone', st.aa.pending === 'apply' && !st.aa.conflict && sha(un.bin + '.woc-orig') === sha(UNPROVEN) &&
+        sha(un.bin) !== sha(UNPROVEN), JSON.stringify(st.aa));
+    pu.proc.kill('SIGKILL');
+    fs.unlinkSync(path.join(un.shm, 'aa-pending'));
+    var ua = hook(un, 'activate');
+    ok('untested aapd once enabled: an install keeps it patched like a proven one', ua.code === 0 && !ua.result.aa.conflict && sha(un.bin + '.woc-orig') === sha(UNPROVEN), ua.out);
+    ua = hook(un, 'deactivate');
+    ok('untested aapd: a removal restores it byte-exact', ua.code === 0 && sha(un.bin) === sha(UNPROVEN) && sha(un.conf) === sha(SRCCONF) && !fs.existsSync(un.bin + '.woc-orig'), ua.out);
+
+    /* Patch refuses what the app does not offer it for: an
+     * untested aapd that aapd.service does not start, an unusable aapd.conf. */
+    var refused = [['an untested aapd that aapd.service does not start', foreignAapd, /aapd\.service starts \/opt\/other\/aapd/], ['an aapd.conf without the 12.3" codec', function (u) {
+        fs.writeFileSync(u.conf, SRCCONF.toString('utf8').replace(/"HIGH_1080P"\s*\]/, '"NONE"]'));
+    }, /aapd\.conf not usable/]];
+    for (var ri = 0; ri < refused.length; ri++) {
+        var fu = patchdUnit();
+        refused[ri][1](fu);
+        var binBefore = sha(fu.bin), confBefore = sha(fu.conf);
+        var pf2 = await daemon(fu);
+        await pf2.next(function (m) { return m.ev === 'status'; });
+        pf2.send({ cmd: 'aa-apply' });
+        st = await pf2.next(function (m) { return m.ev === 'status' && m.aa && m.aa.state === 'error'; });
+        ok('Patch with ' + refused[ri][0] + ': refused with the conflict, nothing written', refused[ri][2].test(st.aa.reason) &&
+            sha(fu.bin) === binBefore && sha(fu.conf) === confBefore && !fs.existsSync(fu.bin + '.woc-orig') && !marker(fu, 'aa-pending'), JSON.stringify(st.aa));
+        pf2.proc.kill('SIGKILL');
+    }
+
+    /* Patch while the connect-time read is still running
+     * (aapd_patch.js status slowed to 3 s) checks a read made after it
+     * arrived, not the daemon's placeholder state. */
+    var slow = patchdUnit();
+    foreignAapd(slow);
+    slowStatus(slow);
+    var ps = await daemon(slow);
+    await sleep(1000);
+    ps.send({ cmd: 'aa-apply' });
+    st = await ps.next(function (m) { return m.ev === 'status' && m.aa && m.aa.state === 'error'; }, 30000);
+    ok('Patch during the connect-time read: refused with the foreign start, nothing written', /aapd\.service starts \/opt\/other\/aapd/.test(st.aa.reason) &&
+        sha(slow.bin) === sha(UNPROVEN) && sha(slow.conf) === sha(SRCCONF) && !fs.existsSync(slow.bin + '.woc-orig'), JSON.stringify(st.aa));
+    ps.proc.kill('SIGKILL');
+
+    /* A density change during the connect-time read on a patched unit
+     * applies it, whatever the daemon's placeholder state says. */
+    var sd = patchdUnit();
+    patcher(sd, ['apply', '--yes']);
+    slowStatus(sd);
+    var psd = await daemon(sd);
+    await sleep(1000);
+    psd.send({ cmd: 'aa-density', value: 200 });
+    st = await psd.next(function (m) { return aaDone(m) && m.aa.dpi === 200; }, 40000);
+    ok('a density change during the connect-time read: applied to aapd.conf', JSON.parse(fs.readFileSync(sd.conf, 'utf8')).SCREENS.KOMBI_DISPLAY.CODEC_DEFINITION.HIGH_1080P.REPORTED_SCREEN_DENSITY === 200, JSON.stringify(st.aa));
+    psd.proc.kill('SIGKILL');
+
+    /* Zoom and the turn card under a conflict other than an untested
+     * build (aapd.service starting another program): each refused with the
+     * conflict, neither the choice nor aapd or aapd.conf written. */
+    var zc = patchdUnit();
+    patcher(zc, ['apply', '--yes']);
+    fs.mkdirSync(path.join(zc.d, 'units', 'aapd.service.d'));
+    fs.writeFileSync(path.join(zc.d, 'units', 'aapd.service.d', 'x.conf'), '[Service]\nExecStart=\nExecStart=/opt/other/aapd\n');
+    var zBin = sha(zc.bin), zConf = sha(zc.conf);
+    var pz = await daemon(zc);
+    await pz.next(function (m) { return m.ev === 'status'; });
+    pz.send({ cmd: 'aa-density', value: 200 });
+    st = await pz.next(function (m) { return m.ev === 'refused' && m.cmd === 'aa-density'; });
+    ok('Zoom under a foreign start: refused with the conflict, nothing written', /aapd\.service starts \/opt\/other\/aapd/.test(st.reason) &&
+        sha(zc.bin) === zBin && sha(zc.conf) === zConf && !fs.existsSync(path.join(zc.d, 'var', 'aa-density')), JSON.stringify(st));
+    await pz.next(function (m) { return m.ev === 'status' && m.aa && m.aa.state !== 'busy'; });
+    pz.send({ cmd: 'aa-card', value: 'hidden' });
+    st = await pz.next(function (m) { return m.ev === 'refused' && m.cmd === 'aa-card'; });
+    ok('the turn card under a foreign start: refused with the conflict, not for the spacing; nothing written', /aapd\.service starts \/opt\/other\/aapd/.test(st.reason) &&
+        sha(zc.bin) === zBin && sha(zc.conf) === zConf && !fs.existsSync(path.join(zc.d, 'var', 'aa-card')) && cropEnv(zc) === null, JSON.stringify(st));
+    pz.proc.kill('SIGKILL');
 
     /* A density or card change is busy from the moment it is accepted:
      * nothing else starts meanwhile, a reboot included. */
@@ -633,23 +1145,34 @@ async function socketTests() {
 
 /* ---- boot recovery for aapd ---- */
 var recovery = require('../recovery.js');
-var AT = recovery.TARGETS.aapd;
+var record = require('../patch_record.js');
+/* The aapd watcher on a patched aapd of ours (its backup and record) in a
+ * folder of its own, with systemd and the restore stubbed. */
 function fakeRec(opts) {
-    var d = fs.mkdtempSync(path.join(os.tmpdir(), 'woc-aarec-'));
+    var d = opts.dir || fs.mkdtempSync(path.join(os.tmpdir(), 'woc-aarec-'));
     dirs.push(d);
+    var t = recovery.targets({ state: path.join(d, 'boot-recovery.json'), sock: path.join(d, 'patch.sock'), carplay: path.join(d, 'carplay'),
+        aapd: path.join(d, 'aapd'), aapdConf: path.join(d, 'aapd.conf') }).aapd;
+    if (!opts.dir) {
+        fs.writeFileSync(t.target + '.woc-orig', 'aapd\n');
+        fs.writeFileSync(t.target + '.woc-orig.json', JSON.stringify({ sha256_original: sha(Buffer.from('aapd\n')) }));
+        fs.writeFileSync(t.target, 'patched aapd\n');
+        record.write(t.target, { patched: true, proven: true });
+    }
+    if (opts.killed) fs.writeFileSync(t.killed, opts.killed + '\n');
     var now = 0, ev = [], info = opts.info || { state: 'active', run: 'r1', pid: 1 };
     var rec = new recovery.Recovery({
-        target: AT, statePath: path.join(d, 'aa.json'), bootId: opts.boot || 'B1', threshold: 2, healthyMs: 60000,
-        classify: function (cb) { ev.push('classify'); cb({ ok: true, patchActive: true, restorable: true }); },
-        restore: function (cb) { ev.push('restore'); cb(null); },
+        target: t, bootId: opts.boot || 'B1', healthyMs: 60000,
+        restore: function (f, cb) { ev.push('restore'); cb(null, 'restored'); },
         probe: function (cb) { cb(rec.info); }, systemState: function (cb) { cb('running'); },
-        start: function (cb) { ev.push('start'); cb(null); }, mark: opts.mark || function () { return null; },
-        hasBackup: function () { return true; }, alive: function () { return false; }, killed: function () { return opts.killed || ''; },
+        start: function (cb) { ev.push('start'); cb(null); },
+        alive: function () { return false; },
         recmgrLoaded: function (n) { ev.push('recmgr ' + n); return opts.recmgr !== false; },
         lock: { tryAcquire: function () { return true; }, release: function () {} }, now: function () { return now; }, log: function () {},
     });
     rec.info = info;
     rec.ev = ev;
+    rec.dir = d;
     rec.advance = function (ms) { now += ms; };
     return rec;
 }
@@ -684,11 +1207,8 @@ async function recoveryTests() {
     var st = JSON.parse(fs.readFileSync(b.statePath, 'utf8'));
     ok('aapd crashes: the boot\'s starts are on disk', st.starts && st.starts.n === 3, JSON.stringify(st));
 
-    var c = fakeRec({});
-    await new Promise(function (r) { c.startBoot(r); });
-    c.info = { state: 'failed', result: 'signal', code: '2', status: '9', run: 'pk', pid: 0 };
     var k = fakeRec({ killed: 'pk' });
-    k.info = c.info;
+    k.info = { state: 'failed', result: 'signal', code: '2', status: '9', run: 'pk', pid: 0 };
     await new Promise(function (r) { k.startBoot(r); });
     k.advance(6000);
     var z = await tick(k);
@@ -706,25 +1226,22 @@ async function recoveryTests() {
      * aapd; a switch-off (mark running) counts nothing. */
     var d = fakeRec({ boot: 'B1' });
     await new Promise(function (r) { d.startBoot(r); });
-    var d2 = fakeRec({ boot: 'B2', mark: function () { return 'failed'; } });
-    d2.statePath = d.statePath;
-    var r2 = await new Promise(function (r) { d2.startBoot(r); });
-    var d3 = fakeRec({ boot: 'B3', mark: function () { return 'failed'; } });
-    d3.statePath = d.statePath;
-    var r3 = await new Promise(function (r) { d3.startBoot(r); });
+    fs.writeFileSync(path.join(d.dir, 'shutdown-aapd'), 'B1 failed crash\n');
+    var r2 = await new Promise(function (r) { fakeRec({ boot: 'B2', dir: d.dir }).startBoot(r); });
+    fs.writeFileSync(path.join(d.dir, 'shutdown-aapd'), 'B2 failed crash\n');
+    var r3 = await new Promise(function (r) { fakeRec({ boot: 'B3', dir: d.dir }).startBoot(r); });
     ok('boot step: two boots whose aapd failed restore before aapd starts', r2.action === 'armed' && r3.action === 'restored', JSON.stringify([r2, r3]));
     var s1 = fakeRec({ boot: 'S1' });
     await new Promise(function (r) { s1.startBoot(r); });
-    var s2 = fakeRec({ boot: 'S2', mark: function () { return 'running'; } });
-    s2.statePath = s1.statePath;
-    var rs = await new Promise(function (r) { s2.startBoot(r); });
+    fs.writeFileSync(path.join(s1.dir, 'shutdown-aapd'), 'S1 running\n');
+    var rs = await new Promise(function (r) { fakeRec({ boot: 'S2', dir: s1.dir }).startBoot(r); });
     ok('boot step: a switch-off within seconds (mark running) is no failure', rs.action === 'armed' && rs.fails === 0, JSON.stringify(rs));
 
     /* The real boot step on copies: the restore before aapd, / read-only. */
     var t = patchdUnit();
     patcher(t, ['apply', '--yes']);
     var state = path.join(t.d, 'var', 'boot-recovery.json');
-    fs.writeFileSync(path.join(t.d, 'var', 'aa-boot-recovery.json'), JSON.stringify({ fails: 1, arm: { boot: 'old', crashes: 1 } }));
+    fs.writeFileSync(path.join(t.d, 'var', 'aa-boot-recovery.json'), JSON.stringify({ fails: 1, unknown: 0, arm: { boot: 'old', crashes: 1 } }));
     fs.writeFileSync(path.join(t.d, 'bootid'), 'new\n');
     var env = Object.assign({}, t.env, { WOC_RECOVERY_STATE: state, WOC_BOOT_ID: path.join(t.d, 'bootid') });
     var res = cp.spawnSync(process.execPath, [path.join(PATCH, 'recovery.js'), 'boot', 'aapd'], { env: env, encoding: 'utf8', timeout: 60000 });
@@ -733,10 +1250,22 @@ async function recoveryTests() {
     var cpState = fs.existsSync(state);
     ok('real boot step: carplay\'s counter untouched', !cpState);
 
+    /* A restore cut short after aapd (aapd.conf still patched): patchd
+     * reports the restore, and an install does not apply the patch again. */
+    var q = patchdUnit();
+    patcher(q, ['apply', '--yes']);
+    var patchedConf = fs.readFileSync(q.conf);
+    var qr = cp.spawnSync(process.execPath, ['-e', 'var r = require(process.argv[1]); r.restoreTarget(r.TARGETS.aapd, true, 2, function (e, o) { process.stdout.write(String(e || o)); });',
+        path.join(PATCH, 'recovery.js')], { env: Object.assign({}, q.env, { WOC_RECOVERY_STATE: path.join(q.d, 'var', 'boot-recovery.json') }), encoding: 'utf8' });
+    fs.writeFileSync(q.conf, patchedConf);
+    var qh = hook(q, 'activate');
+    ok('a restore that left aapd.conf patched: an install leaves aapd off and says why', qr.stdout === 'restored' && sha(q.bin) === sha(SRC) &&
+        /boot recovery removed the patch after 2 failed head-unit starts/.test((qh.result.aa || {}).status || ''), qr.stdout + qr.stderr + ' ' + JSON.stringify(qh.result));
+
     /* The boot step's SIGTERM waits for a restore in progress. */
     var u = patchdUnit();
     patcher(u, ['apply', '--yes']);
-    fs.writeFileSync(path.join(u.d, 'var', 'aa-boot-recovery.json'), JSON.stringify({ fails: 2, arm: null }));
+    fs.writeFileSync(path.join(u.d, 'var', 'aa-boot-recovery.json'), JSON.stringify({ fails: 2, unknown: 0, arm: null }));
     fs.writeFileSync(u.env.WOC_MOUNT, '#!/bin/sh\nsleep 1\ncase "$*" in *rw*) echo "/dev/root / ext4 rw 0 0" > "' + u.mounts + '";; *) echo "/dev/root / ext4 ro 0 0" > "' + u.mounts + '";; esac\n');
     var envU = Object.assign({}, u.env, { WOC_RECOVERY_STATE: path.join(u.d, 'var', 'boot-recovery.json'), WOC_BOOT_ID: path.join(u.d, 'bootid') });
     fs.writeFileSync(path.join(u.d, 'bootid'), 'x\n');
@@ -755,8 +1284,8 @@ async function recoveryTests() {
         var cpr = cp.spawnSync(process.execPath, [path.join(PATCH, 'carplay_patch.js'), 'apply', '--panel', 'high', '--target', both.carplay, '--yes'], { encoding: 'utf8' });
         fs.writeFileSync(both.env.WOC_MOUNT, '#!/bin/sh\nsleep 1\ncase "$*" in *rw*) echo "/dev/root / ext4 rw 0 0" > "' + both.mounts + '";; *) echo "/dev/root / ext4 ro 0 0" > "' + both.mounts + '";; esac\n');
         var bv = path.join(both.d, 'var');
-        fs.writeFileSync(path.join(bv, 'boot-recovery.json'), JSON.stringify({ fails: 2, arm: null }));
-        fs.writeFileSync(path.join(bv, 'aa-boot-recovery.json'), JSON.stringify({ fails: 2, arm: null }));
+        fs.writeFileSync(path.join(bv, 'boot-recovery.json'), JSON.stringify({ fails: 2, unknown: 0, arm: null }));
+        fs.writeFileSync(path.join(bv, 'aa-boot-recovery.json'), JSON.stringify({ fails: 2, unknown: 0, arm: null }));
         fs.writeFileSync(path.join(both.d, 'bootid'), 'b\n');
         var be = Object.assign({}, both.env, { WOC_RECOVERY_STATE: path.join(bv, 'boot-recovery.json'), WOC_BOOT_ID: path.join(both.d, 'bootid') });
         var ends = await Promise.all(['carplay', 'aapd'].map(function (n) {
@@ -772,19 +1301,22 @@ async function recoveryTests() {
     }
 
     /* A boot cut off with no record of its own counts for the service
-     * that crashed in it, not for the other. */
-    [[1, 0], [0, 1]].forEach(function (c) {
+     * that crashed in it, not for the other; with no crash of either it is
+     * unknown for carplay (power lost), and the second such boot in a row
+     * counts one. */
+    [[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 1]].forEach(function (c) {
         var x = patchdUnit();
         var vs = path.join(x.d, 'var');
         fs.writeFileSync(x.carplay + '.woc-orig', 'x');
-        fs.writeFileSync(path.join(vs, 'boot-recovery.json'), JSON.stringify({ fails: 0, arm: { boot: 'old', crashes: 0 } }));
-        fs.writeFileSync(path.join(vs, 'aa-boot-recovery.json'), JSON.stringify({ fails: 0, prev: null, arm: { boot: 'old', crashes: c[0] } }));
+        fs.writeFileSync(path.join(vs, 'boot-recovery.json'), JSON.stringify({ fails: 0, unknown: c[3], arm: { boot: 'old', crashes: 0 } }));
+        fs.writeFileSync(path.join(vs, 'aa-boot-recovery.json'), JSON.stringify({ fails: 0, unknown: 0, prev: null, arm: { boot: 'old', crashes: c[0] } }));
         fs.writeFileSync(path.join(x.d, 'bootid'), 'new\n');
         var e = Object.assign({}, x.env, { WOC_RECOVERY_STATE: path.join(vs, 'boot-recovery.json'), WOC_BOOT_ID: path.join(x.d, 'bootid') });
         cp.spawnSync(process.execPath, [path.join(PATCH, 'recovery.js'), 'boot', 'carplay'], { env: e, encoding: 'utf8', timeout: 30000 });
         var cst = JSON.parse(fs.readFileSync(path.join(vs, 'boot-recovery.json'), 'utf8'));
-        ok(c[0] ? 'an unrecorded end after aapd crashed in that boot is not carplay\'s failure' : 'an unrecorded end with no aapd crash still counts for carplay (power lost)',
-            cst.fails === c[1] && cst.arm.boot === 'new', JSON.stringify(cst));
+        ok(c[0] ? 'an unrecorded end after aapd crashed in that boot is not carplay\'s failure'
+            : c[3] ? 'a second unrecorded end in a row with no aapd crash counts one for carplay' : 'a first unrecorded end with no aapd crash is unknown for carplay (power lost)',
+            cst.fails === c[1] && cst.unknown === c[2] && cst.arm.boot === 'new', JSON.stringify(cst));
     });
 
     /* shutdown_mark.sh: aapd SIGKILLed is stopped (no crash), as for its
@@ -798,16 +1330,16 @@ async function recoveryTests() {
     var mr = cp.spawnSync('sh', [path.join(PATCH, 'shutdown_mark.sh')], { env: Object.assign({}, process.env, { WOC_STATE_DIR: path.join(md, 'state'),
         WOC_BOOT_ID: path.join(md, 'boot_id'), WOC_SYSTEMCTL: path.join(md, 'systemctl'), WOC_MARK_WAIT: '2' }) });
     ok('shutdown mark: a SIGKILLed aapd is stopped, a SIGKILLed carplay (no drop-in) failed', mr.status === 0 &&
-        fs.readFileSync(path.join(md, 'state', 'shutdown-aapd'), 'utf8') === 'B stopped\n' && fs.readFileSync(path.join(md, 'state', 'shutdown'), 'utf8') === 'B failed\n');
+        /^B stopped up \d+\n$/.test(fs.readFileSync(path.join(md, 'state', 'shutdown-aapd'), 'utf8')) && /^B failed up \d+\n$/.test(fs.readFileSync(path.join(md, 'state', 'shutdown'), 'utf8')));
     fs.writeFileSync(path.join(md, 'systemctl'), '#!/bin/sh\nprintf "ActiveState=failed\\nResult=signal\\nExecMainCode=2\\nExecMainStatus=90\\n"\n');
     cp.spawnSync('sh', [path.join(PATCH, 'shutdown_mark.sh')], { env: Object.assign({}, process.env, { WOC_STATE_DIR: path.join(md, 'state'),
         WOC_BOOT_ID: path.join(md, 'boot_id'), WOC_SYSTEMCTL: path.join(md, 'systemctl'), WOC_MARK_WAIT: '2' }) });
-    ok('shutdown mark: another signal end of aapd is failed', fs.readFileSync(path.join(md, 'state', 'shutdown-aapd'), 'utf8') === 'B failed\n');
+    ok('shutdown mark: another signal end of aapd is failed', /^B failed up \d+\n$/.test(fs.readFileSync(path.join(md, 'state', 'shutdown-aapd'), 'utf8')));
     fs.writeFileSync(path.join(md, 'state', 'shutdown-aapd'), 'B stopped\n');
     fs.writeFileSync(path.join(md, 'systemctl'), '#!/bin/sh\nprintf "ActiveState=failed\\nResult=oom-kill\\nExecMainCode=2\\nExecMainStatus=9\\n"\n');
     cp.spawnSync('sh', [path.join(PATCH, 'shutdown_mark.sh')], { env: Object.assign({}, process.env, { WOC_STATE_DIR: path.join(md, 'state'),
         WOC_BOOT_ID: path.join(md, 'boot_id'), WOC_SYSTEMCTL: path.join(md, 'systemctl'), WOC_MARK_WAIT: '2' }) });
-    ok('shutdown mark: an oom-killed aapd (status 9) is failed', fs.readFileSync(path.join(md, 'state', 'shutdown-aapd'), 'utf8') === 'B failed\n');
+    ok('shutdown mark: an oom-killed aapd (status 9) is failed', /^B failed up \d+\n$/.test(fs.readFileSync(path.join(md, 'state', 'shutdown-aapd'), 'utf8')));
 
     ok('the units\' timeouts cover the restore bound', [/TimeoutStartSec=(\d+)/, /TimeoutStopSec=(\d+)/].every(function (re) {
         return Number(re.exec(fs.readFileSync(path.join(PATCH, '..', 'systemd', 'waze-on-cluster-aa-boot.service'), 'utf8'))[1]) * 1000 > recovery.BOOT_BOUND_MS + 5000;
@@ -821,7 +1353,98 @@ async function recoveryTests() {
         comp.crashNames.indexOf('aapd') >= 0 && !comp.restart.some(function (x) { return /boot/.test(x); }), JSON.stringify(comp.recmgr));
 }
 
+/* Android Auto on a head unit that refuses our parts, and on MID and HIGH F. */
+function headUnitTests() {
+    var NOT = headUnit.REFUSED;
+    var t = unit();
+    headUnit.set(headUnit.NONE);
+    var r = patcher(t, ['apply', '--yes']);
+    ok('no hwvariant=: aapd apply refuses with the reason line, writes nothing', r.code !== 0 && r.out === 'error: refusing: ' + NOT + '\n' && untouched(t), r.out);
+    headUnit.set(null);
+    r = patcher(t, ['apply', '--yes']);
+    ok('no kernel command line: aapd apply refuses, writes nothing', r.code !== 0 && /unknown variant is not supported \(kernel command line unreadable\)/.test(r.out) && untouched(t), r.out);
+    [['MID', headUnit.MID], ['HIGH F', headUnit.HIGHF]].forEach(function (v) {
+        headUnit.set(v[1]);
+        patcher(t, ['revert', '--yes']);
+        r = patcher(t, ['apply', '--yes']);
+        ok(v[0] + ': aapd apply patches', r.code === 0 && sha(t.bin) !== sha(SRC), r.out);
+    });
+    headUnit.set(headUnit.NONE);
+    r = patcher(t, ['revert', '--yes']);
+    ok('no hwvariant=: aapd revert restores both files', r.code === 0 && sha(t.bin) === sha(SRC) && sha(t.conf) === sha(SRCCONF), r.out);
+
+    var u = patchdUnit();
+    r = hook(u, 'activate');
+    ok('no hwvariant=: activate leaves Android Auto, the conflict, no marker', r.code === 0 && r.result.aa && r.result.aa.conflict === 'not supported on this car (' + NOT + ')' &&
+        untouched(u) && !marker(u, 'aa-pending'), JSON.stringify(r.result));
+
+    var b = patchdUnit();
+    headUnit.set(headUnit.HIGH);
+    patcher(b, ['apply', '--yes']);
+    headUnit.set(headUnit.NONE);
+    fs.writeFileSync(path.join(b.d, 'bootid'), 'new\n');
+    var env = Object.assign({}, b.env, { WOC_RECOVERY_STATE: path.join(b.d, 'var', 'boot-recovery.json'), WOC_BOOT_ID: path.join(b.d, 'bootid') });
+    r = cp.spawnSync(process.execPath, [path.join(PATCH, 'recovery.js'), 'boot', 'aapd'], { env: env, encoding: 'utf8', timeout: 60000 });
+    ok('no hwvariant=: the boot step restores aapd and aapd.conf before aapd starts, below the threshold, / read-only', r.status === 0 &&
+        sha(b.bin) === sha(SRC) && sha(b.conf) === sha(SRCCONF) && ro(b) && /aapd boot check: restored/.test(r.stdout), r.stdout + r.stderr);
+
+    var c = patchdUnit();
+    headUnit.set(headUnit.HIGH);
+    patcher(c, ['apply', '--yes']);
+    fs.appendFileSync(c.conf, '# another tool\n');
+    var conf2 = sha(c.conf);
+    headUnit.set(headUnit.NONE);
+    var calls = path.join(c.d, 'mount.calls');
+    fs.writeFileSync(c.env.WOC_MOUNT, '#!/bin/sh\necho "$*" >> "' + calls + '"\n' +
+        'case "$*" in *rw*) echo "/dev/root / ext4 rw 0 0" > "' + c.mounts + '";; *) echo "/dev/root / ext4 ro 0 0" > "' + c.mounts + '";; esac\n');
+    var bootEnv = Object.assign({}, c.env, { WOC_RECOVERY_STATE: path.join(c.d, 'var', 'boot-recovery.json'), WOC_BOOT_ID: path.join(c.d, 'bootid') });
+    function boot(id) {
+        fs.writeFileSync(path.join(c.d, 'bootid'), id + '\n');
+        try { fs.unlinkSync(calls); } catch (e) {}
+        return cp.spawnSync(process.execPath, [path.join(PATCH, 'recovery.js'), 'boot', 'aapd'], { env: bootEnv, encoding: 'utf8', timeout: 60000 });
+    }
+    r = boot('b1');
+    ok('no hwvariant=, aapd.conf changed by another tool: aapd restored, the conf left', r.status === 0 && sha(c.bin) === sha(SRC) && sha(c.conf) === conf2 &&
+        fs.existsSync(calls) && ro(c), r.stdout + r.stderr);
+    r = boot('b2');
+    ok('no hwvariant=, aapd.conf changed by another tool: the next boot leaves / alone', r.status === 0 && !fs.existsSync(calls) && /aapd boot check: idle/.test(r.stdout), r.stdout + r.stderr);
+
+    /* A car 0.8.2's boot recovery restored on HIGH F: the first install there
+     * applies Android Auto's patch again, pending; none after it, nor on
+     * HIGH, nor over an untrusted backup. */
+    function restored(unit, mark) {
+        var x = patchdUnit();
+        headUnit.set(headUnit.HIGH);
+        hook(x, 'activate');
+        ['aa-pending', 'activation-pending'].forEach(function (n) { try { fs.unlinkSync(path.join(x.shm, n)); } catch (e) {} });
+        patcher(x, ['revert', '--yes']);
+        if (mark) fs.writeFileSync(path.join(x.d, 'var', 'highf-repatched'), '{"carplay":"applied","aa":"applied"}\n');
+        headUnit.set(unit);
+        return x;
+    }
+    var x = restored(headUnit.HIGHF);
+    r = hook(x, 'activate');
+    ok('HIGH F restored by 0.8.2: Android Auto applied again, pending', r.code === 0 && r.result.aa && r.result.aa.reset === true &&
+        sha(x.bin) !== sha(SRC) && marker(x, 'aa-pending') && marker(x, 'aa-pending').action === 'apply' &&
+        JSON.parse(fs.readFileSync(path.join(x.d, 'var', 'highf-repatched'), 'utf8')).aa === 'applied', JSON.stringify(r.result));
+    [['HIGH F, marker present', function () { return restored(headUnit.HIGHF, true); }], ['HIGH', function () { return restored(headUnit.HIGH); }]].forEach(function (c) {
+        var y = c[1]();
+        r = hook(y, 'activate');
+        ok(c[0] + ': Android Auto stays off', r.code === 0 && sha(y.bin) === sha(SRC) && !marker(y, 'aa-pending') && /turned off/.test(r.result.aa.status),
+            JSON.stringify(r.result));
+    });
+    var z = restored(headUnit.HIGHF);
+    fs.writeFileSync(z.bin + '.woc-orig.json', JSON.stringify({ sha256_original: '0'.repeat(64) }));
+    r = hook(z, 'activate');
+    var zMark = {};
+    try { zMark = JSON.parse(fs.readFileSync(path.join(z.d, 'var', 'highf-repatched'), 'utf8')); } catch (e) {}
+    ok('HIGH F, untrusted aapd backup: Android Auto stays off, left for the next install', r.code === 0 && sha(z.bin) === sha(SRC) &&
+        !marker(z, 'aa-pending') && !zMark.aa, JSON.stringify(r.result));
+    headUnit.set(headUnit.HIGH);
+}
+
 (async function () {
+    headUnitTests();
     await socketTests();
     await recoveryTests();
     process.stdout.write(fails ? fails + ' FAILED\n' : 'all passed\n');

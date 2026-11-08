@@ -340,7 +340,7 @@ void Server::accept_client(int64_t)
         Client c;
         c.fd = fd;
         c.id = next_client_++;
-        clients_.push_back(c);
+        clients_.push_back(std::move(c));
     }
 }
 
@@ -360,23 +360,20 @@ void Server::read_client(Client &c, int64_t now_ms)
     /* At most a few messages' worth per pass, so one busy producer cannot
      * hold the render loop. */
     size_t budget = 4 << 20;
-    char buf[65536];
     for (;;) {
-        ssize_t r = read(c.fd, buf, sizeof buf);
+        ssize_t r = c.in.fill(c.fd);
         if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) {
             c.closing = true;
             break;
         }
         if (r < 0)
             break;
-        c.in.append(buf, (size_t)r);
         for (;;) {
-            size_t used = 0, body_len = 0;
+            size_t body_len = 0;
             uint8_t type = 0;
             const char *body = nullptr;
             bool bad = false;
-            if (!cr::next_message(c.in.data() + c.in_off, c.in.size() - c.in_off, &used, &type, &body, &body_len,
-                                  &bad)) {
+            if (!c.in.next(&type, &body, &body_len, &bad)) {
                 if (bad) {
                     log_warn("client %llu: malformed message, disconnected", (unsigned long long)c.id);
                     c.closing = true;
@@ -389,14 +386,10 @@ void Server::read_client(Client &c, int64_t now_ms)
                 on_frame(c, body, body_len, now_ms);
             else if (type == cr::kMesh)
                 on_mesh(c, body, body_len, now_ms);
-            c.in_off += used;
             if (c.closing)
                 break;
         }
-        if (c.in_off) {
-            c.in.erase(0, c.in_off);
-            c.in_off = 0;
-        }
+        c.in.settle();
         if (c.closing || (size_t)r >= budget)
             break;
         budget -= (size_t)r;
@@ -580,7 +573,8 @@ void Server::on_json(Client &c, const std::string &body, int64_t now_ms)
         send(c, cr::json_object({{"ev", cr::json_quote("hello")},
                                  {"proto", std::to_string(cr::kProtocolVersion)},
                                  {"backend", cr::json_quote(backend_)},
-                                 {"targets", cr::json_quote(targets)}}));
+                                 {"targets", cr::json_quote(targets)},
+                                 {"repeat", "1"}}));
         c.target_sent.clear();
         log_info("client %llu: %s", (unsigned long long)c.id, c.app.c_str());
         return;
@@ -603,6 +597,18 @@ void Server::on_json(Client &c, const std::string &body, int64_t now_ms)
     const uint32_t ref = (uint32_t)ref_d;
     auto it = c.refs.find(ref);
     Layer *l = it == c.refs.end() ? nullptr : comp_->layer(c.id, it->second);
+    if (op == "repeat") {
+        const bool video = l && std::string(l->kind()) == "video";
+        if (video)
+            static_cast<VideoLayer *>(l)->repeat(now_ms);
+        /* Answered at most once per ref, as frames are (on_frame). */
+        const std::string why = video ? "" : l ? "only a video layer repeats a frame" : "no such layer";
+        std::string &last = c.frame_error[l ? ref : 0];
+        if (!why.empty() && why != last)
+            error(c, op, ref, why);
+        last = why;
+        return;
+    }
     if (op == "drop") {
         auto a = c.assets.find(ref);
         if (a != c.assets.end()) {
@@ -942,10 +948,10 @@ void Server::report(int64_t now_ms)
             if (!slots_->targets()[t].follows.empty())
                 continue;   /* a hold: no client's target */
             const TargetStatus &s = slots_->status((int)t);
-            const bool hold_off = slots_->hold_disabled((int)t);
+            const bool hold_off = slots_->hold_disabled((int)t), off = slots_->disabled((int)t);
             const std::string line = std::string(target_state_name(s.state)) + "\n" + holder_name(s.holder) + "\n" +
                                      s.reason + "\n" + std::to_string(s.retry_ms) + "\n" +
-                                     rendering_name(s.rendering) + "\n" + (hold_off ? "1" : "0");
+                                     rendering_name(s.rendering) + "\n" + (hold_off ? "1" : "0") + (off ? "1" : "0");
             std::string &sent = c.target_sent[slots_->targets()[t].name];
             if (line == sent)
                 continue;
@@ -958,7 +964,8 @@ void Server::report(int64_t now_ms)
                                      {"retry_in_ms", std::to_string(s.retry_ms >= 0 ? std::max<int64_t>(0, s.retry_ms - now_ms)
                                                                                    : -1)},
                                      {"rendering", cr::json_quote(rendering_name(s.rendering))},
-                                     {"guide_disabled", hold_off ? "1" : "0"}}));
+                                     {"guide_disabled", hold_off ? "1" : "0"},
+                                     {"disabled", off ? "1" : "0"}}));
         }
         const Governor &gov = comp_->governor();
         const std::string budget = std::to_string(gov.cap()) + "\n" + gov.reason();
@@ -1013,6 +1020,7 @@ std::string Server::status_text(int64_t now_ms) const
     s += slots_->guard_text();
     s += slots_->renderer_text(now_ms);
     s += slots_->port().status_text(now_ms);
+    s += slots_->table_text();
     for (const Client &c : clients_)
         for (const auto &kv : c.assets)
             for (const Asset *a : comp_->assets())
